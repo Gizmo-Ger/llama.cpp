@@ -2861,6 +2861,13 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         auto & sinfo = sinfos[seq_id];
 
+        // ARC-LAB: LLAMA_ARG_SPEC_NGRAM_FRESH=1 forgets earlier requests' n-grams, so each request drafts only from its
+        // own prompt, as on a fresh server (A/B runs repeat the same prompts; otherwise later runs replay earlier answers)
+        static const bool fresh = std::getenv("LLAMA_ARG_SPEC_NGRAM_FRESH") && std::atoi(std::getenv("LLAMA_ARG_SPEC_NGRAM_FRESH"));
+        if (fresh) {
+            mod.reset();
+        }
+
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
         sinfo.n_cur = n_start > 0 ? std::min(n_start, params.n_max) : params.n_max;
