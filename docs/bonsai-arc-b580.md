@@ -80,6 +80,13 @@ Different weights produce different text, so speculation lands a little less oft
   now a work-group per row, 2.5x faster generation at ~115K context.
 - **Gated delta-net** blocked kernel, fused state writes, and several fusions for single-token decode (same-input mat-vecs
   in one launch, narrow concat, fused gate/up).
+- **Fewer, fused kernels around the ternary mat-vecs (v0.8).** Each token's activation is rotated (Hadamard) and quantized
+  once and reused by every mat-vec that reads it; the residual add + RMS norm, the FFN SwiGLU and the delta-net pre-norm
+  are folded into that rotation; the delta-net conv chain (concat, conv-state write, conv, SiLU, L2 norm) and its gate block
+  run as one kernel each; mat-vecs that share an input (q/k/v, gate/up) run in one launch; small verify batches (up to 32
+  rows) use a smaller TernSYCL tile. Decode attention prefetches the next tile's rows. Plain generation (no speculation):
+  short prompt ~41 -> 46 t/s, 48K context ~36 -> 40, 115K ~31.5 -> 35. With MTP, the attention prefetch alone is +4% at
+  48K and +7.5% at 115K. KL divergence unchanged within noise; the fusions are covered by `test-backend-ops -o ARCLAB_*`.
 - **Memory for 128K on 12 GB:** the MTP draft context now takes its own KV cache type (`-ctkd/-ctvd q4_0`) and a smaller
   physical batch (`LLAMA_ARG_SPEC_DRAFT_UBATCH=512`), and the main prompt batch is 1024.
 
@@ -256,7 +263,10 @@ All optimisations are on by default except the XMX path. The XMX path needs an X
 others it turns itself off with a warning. Set any of these to turn a piece off for comparison:
 `GGML_SYCL_PTQ1_T2_GEMM_OFF`, `GGML_SYCL_PTQ1_MULTI=0`, `GGML_SYCL_PTQ1_MULTI_NCOLS=0`, `GGML_SYCL_PTQ1_GLU1=0`,
 `GGML_SYCL_PTQ1_PAIRS=0`, `GGML_SYCL_PTQ1_NCOLS_DEC_OFF`, `GGML_SYCL_FA_DEC_OFF`, `GGML_SYCL_GDN_BLOCKED_OFF`,
-`GGML_SYCL_GLU_FUSE_OFF`, `GGML_SYCL_TOPK_OLD=1`. Opt-in: `GGML_SYCL_FA_DEC_DPAS=1` (XMX decode attention, Xe2),
+`GGML_SYCL_GLU_FUSE_OFF`, `GGML_SYCL_TOPK_OLD=1`, and from v0.8 (set to 0): `GGML_SYCL_PTQ1_T2_QCACHE`,
+`GGML_SYCL_PTQ1_T2_FWHTQ`, `GGML_SYCL_PTQ1_T2_NORMQ`, `GGML_SYCL_GLU_ROT`, `GGML_SYCL_NORM_ROT_FAR`, `GGML_SYCL_CONV_CHAIN`,
+`GGML_SYCL_DN_GATES`, `GGML_SYCL_T2_MULTI`, `GGML_SYCL_FA_DEC_PF`, `LLAMA_ARG_SPEC_NGRAM_ADAPT` (n-gram draft length that
+starts at 64, doubles on a full accept and halves on a rejection). Opt-in: `GGML_SYCL_FA_DEC_DPAS=1` (XMX decode attention, Xe2),
 `GGML_SYCL_MMVQ_CHUNK_MAX=N` (largest quantized batch run as chunked mat-vecs, default 32), `GGML_SYCL_Q4_0_DPAS=1`
 (q4_0 verify batches on XMX, Xe2), `GGML_SYCL_T2_W8A8_MIN=N` (prompt batches of N+ tokens via oneDNN int8, 0 = off). An MTP GGUF can carry a
 trimmed draft LM head (`blk.<n>.nextn.draft_head`, top-K frequent tokens; ~5% faster drafting on the B580);
