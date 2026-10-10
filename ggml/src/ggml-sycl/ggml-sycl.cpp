@@ -36,9 +36,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
+#ifndef _WIN32
 #include <cxxabi.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#endif
 
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
@@ -677,6 +679,9 @@ struct ggml_sycl_sync_trace {
         if (c) {
             return c;
         }
+#ifdef _WIN32
+        return std::string("?"); // no caller lookup on Windows
+#else
         void * fr[24];
         const int n = backtrace(fr, 24);
         std::string label, last;
@@ -707,6 +712,7 @@ struct ggml_sycl_sync_trace {
             }
         }
         return label.empty() ? std::string("?") : label;
+#endif
     }
     void note_sync() {
         std::lock_guard<std::mutex> lock(mtx);
