@@ -106,6 +106,18 @@ Different weights produce different text, so speculation lands a little less oft
   B580 against v0.8 (same public models, same flags): MTP on mtp-lean 71.9 -> 78.3 t/s (+9%); with a trimmed 32K-token
   draft head 73.8 -> 80.4 (+9%); live MTP + n-gram at 128K context (same head): short 69.9 -> 75.9
   (+8.6%), 48K 73.7 -> 78.7 (+6.8%), 115K 78.8 -> 83.5 (+6.0%). The Results table above is from v0.8.
+- **v0.10.1: fewer round trips, faster long-context attention.** All on by default; greedy outputs byte-identical to v0.10.
+  - The one-graph draft chain returns its 4 draft tokens in one read-back instead of 4. On this SYCL stack each small
+    device-to-host copy costs about 0.2 ms, even for 4 bytes, so this alone is worth about 2% with a draft head.
+  - The q4_0 decode attention kernel runs with the 256-register file for 3+ query tokens (the MTP and n-gram verify
+    batches): no register spills, same occupancy. The kernel is 6-17% faster at 128K.
+  - Three general improvements from [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp): KV `seq_rm`
+    limited to the used cell range (#311), reuse of evicted prompt-checkpoint buffers (#312), and top-k taken straight
+    from the logits when it starts the sampler chain (#313).
+
+  B580 against v0.10 (same public models and flags): MTP with a trimmed 32K-token draft head 80.4 -> 84.7 t/s (+5.4%);
+  MTP on mtp-lean 78.3 -> 80.5 (+2.8%); live MTP + n-gram at 128K context (same head): short 75.9 -> 78.6 (+3.6%), 48K
+  78.7 -> 82.4 (+4.7%), 115K 83.5 -> 88.9 (+6.5%). Against v0.8 that is +12 to +15%.
 - **Memory for 128K on 12 GB:** the MTP draft context now takes its own KV cache type (`-ctkd/-ctvd q4_0`) and a smaller
   physical batch (`LLAMA_ARG_SPEC_DRAFT_UBATCH=512`), and the main prompt batch is 1024.
 
@@ -295,7 +307,9 @@ From v0.10 (set to 0): `LLAMA_GDN_REPLAY` (delta-net replay rollback), `LLAMA_MT
 `LLAMA_MTP_CHAIN` (one-graph draft chain; on only for a GGUF with a trimmed draft head, =1 forces it),
 `LLAMA_MTP_CHAIN_GPU_EMBD` (its device copy of the draft-vocab embeddings), `GGML_SYCL_PTQ1_T2_TUNED` (B580 verify
 tiles; =1 forces them on other GPUs). Bit masks, 0 = previous behaviour: `LLAMA_MTP_CHAIN_TIGHT` (draft graph layout,
-default 15), `LLAMA_SYNC_TRIM` (skip redundant context syncs and keep the KV rotation matrices on the device, default 3).
+default 31 from v0.10.1; bit 16 = one read-back for all draft tokens), `LLAMA_SYNC_TRIM` (skip redundant context syncs and keep the KV rotation matrices on the device, default 3).
+From v0.10.1: `GGML_SYCL_FA_DEC_GRF=0` turns off the 256-register file for the decode attention; opt-in
+`GGML_SYCL_FA_DEC_B2D=1` (2D block loads for its K/V reads; within noise on the B580).
 `SYCL_UR_USE_LEVEL_ZERO_V2=1` keeps the V2 Level Zero adapter. Diagnostics (off by default, they slow things down):
 `LLAMA_MTP_DRAFT_TIMING=1`, `GGML_SYCL_OP_TIMING=1`, `GGML_SYCL_HOST_TIMING=1`, `GGML_SYCL_SYNC_TRACE=1`.
 
@@ -318,4 +332,5 @@ PR #221) that this branch started from, with the ternary DPAS
 kernels from [libxsmm/TernSYCL](https://github.com/libxsmm/TernSYCL) (BSD 3-Clause; licence and notice included).
 The v0.10 delta-net replay and one-graph MTP drafts are independent implementations of techniques described by
 [llamADALL](https://github.com/straightdot/llamADALL), and the K/V-only MTP prompt pass of one described by
-[GRIMOIRE](https://github.com/doopeworld/GRIMOIRE); no code from either project is used.
+[GRIMOIRE](https://github.com/doopeworld/GRIMOIRE); no code from either project is used. v0.10.1 includes three commits
+from [PrismML's llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp) (#311, #312, #313), with their authorship kept.
