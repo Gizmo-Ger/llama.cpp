@@ -87,6 +87,25 @@ Different weights produce different text, so speculation lands a little less oft
   rows) use a smaller TernSYCL tile. Decode attention prefetches the next tile's rows. Plain generation (no speculation):
   short prompt ~41 -> 46 t/s, 48K context ~36 -> 40, 115K ~31.5 -> 35. With MTP, the attention prefetch alone is +4% at
   48K and +7.5% at 115K. KL divergence unchanged within noise; the fusions are covered by `test-backend-ops -o ARCLAB_*`.
+- **Faster speculation (v0.10).** All on by default; greedy outputs byte-identical to v0.8.
+  - *Tuned verify tiles:* a sweep of the TernSYCL small-batch kernel's launch shape (9,140 configurations at the model's
+    shapes) found faster bit-identical tiles for the 5-token MTP verify: FFN down 0.78x the time, FFN gate+up 0.90x,
+    output head 0.88x, attention q+k+v 0.92x. B580 only by default (the tiles are tuned for its 20 Xe cores).
+  - *Delta-net rollback by replay:* instead of keeping a full recurrent state per verified token so it can roll back
+    rejected drafts, the 48 delta-net layers keep one state plus each token's small update terms and re-apply the
+    accepted ones on the next step. Fewer state writes per verify, and 432 MiB less VRAM at 128K. Independent
+    implementation of the technique described by [llamADALL](https://github.com/straightdot/llamADALL).
+  - *One-graph MTP drafts:* all 4 drafts of a step run in one graph, each step taking the previous step's in-graph argmax,
+    with a device copy of the draft vocabulary's embedding rows; the draft ids are read back once. Needs a GGUF with a
+    trimmed draft head (see Switches). Independent implementation of the technique described by llamADALL.
+  - *Lighter MTP prompt pass:* over a prompt the MTP head computes only the K/V rows it keeps (no attention, FFN or
+    output head for those rows): long prompts read ~5% faster with MTP on. Independent implementation of the technique
+    described by [GRIMOIRE](https://github.com/doopeworld/GRIMOIRE).
+  - The SYCL backend defaults to the legacy Level Zero adapter, which is slightly faster here.
+
+  B580 against v0.8 (same public models, same flags): MTP on mtp-lean 71.9 -> 78.3 t/s (+9%); with a trimmed 32K-token
+  draft head 73.8 -> 80.4 (+9%); live MTP + n-gram at 128K context (same head): short 69.9 -> 75.9
+  (+8.6%), 48K 73.7 -> 78.7 (+6.8%), 115K 78.8 -> 83.5 (+6.0%). The Results table above is from v0.8.
 - **Memory for 128K on 12 GB:** the MTP draft context now takes its own KV cache type (`-ctkd/-ctvd q4_0`) and a smaller
   physical batch (`LLAMA_ARG_SPEC_DRAFT_UBATCH=512`), and the main prompt batch is 1024.
 
@@ -272,6 +291,19 @@ starts at 64, doubles on a full accept and halves on a rejection). Opt-in: `GGML
 trimmed draft LM head (`blk.<n>.nextn.draft_head`, top-K frequent tokens; ~5% faster drafting on the B580);
 `LLAMA_MTP_DRAFT_HEAD_OFF=1` ignores it.
 
+From v0.10 (set to 0): `LLAMA_GDN_REPLAY` (delta-net replay rollback), `LLAMA_MTP_KV_ONLY` (K/V-only MTP prompt pass),
+`LLAMA_MTP_CHAIN` (one-graph draft chain; on only for a GGUF with a trimmed draft head, =1 forces it),
+`LLAMA_MTP_CHAIN_GPU_EMBD` (its device copy of the draft-vocab embeddings), `GGML_SYCL_PTQ1_T2_TUNED` (B580 verify
+tiles; =1 forces them on other GPUs). Bit masks, 0 = previous behaviour: `LLAMA_MTP_CHAIN_TIGHT` (draft graph layout,
+default 15), `LLAMA_SYNC_TRIM` (skip redundant context syncs and keep the KV rotation matrices on the device, default 3).
+`SYCL_UR_USE_LEVEL_ZERO_V2=1` keeps the V2 Level Zero adapter. Diagnostics (off by default, they slow things down):
+`LLAMA_MTP_DRAFT_TIMING=1`, `GGML_SYCL_OP_TIMING=1`, `GGML_SYCL_HOST_TIMING=1`, `GGML_SYCL_SYNC_TRACE=1`.
+
+**Adding a trimmed draft head** (needed for the one-graph draft chain; ~5% faster drafting on its own):
+`python3 scripts/bonsai/add_draft_head.py Ternary-Bonsai-2-27B-PTQ1_0-mtp-lean.gguf bonsai-dh32k.gguf scripts/bonsai/freq_public.json 32768`.
+The token frequencies come from public text only (llama.cpp and Python standard-library source, FineWeb-Edu, Alpaca, and
+the model's own answers to public prompts).
+
 ## Feedback and your numbers
 
 If you run this on a B580 or another Arc card, please post your results (card, driver, context, the numbers you get) in
@@ -284,3 +316,6 @@ Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), PrismML's PTQ
 branch of [professorpalmer/llama.cpp-ada-ternary](https://github.com/professorpalmer/llama.cpp-ada-ternary) (PrismML
 PR #221) that this branch started from, with the ternary DPAS
 kernels from [libxsmm/TernSYCL](https://github.com/libxsmm/TernSYCL) (BSD 3-Clause; licence and notice included).
+The v0.10 delta-net replay and one-graph MTP drafts are independent implementations of techniques described by
+[llamADALL](https://github.com/straightdot/llamADALL), and the K/V-only MTP prompt pass of one described by
+[GRIMOIRE](https://github.com/doopeworld/GRIMOIRE); no code from either project is used.
