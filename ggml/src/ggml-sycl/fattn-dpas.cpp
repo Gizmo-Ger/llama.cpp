@@ -318,11 +318,24 @@ static void fattn_dpas_q4_0(const fa_dpas_params p, const int nkvh, const int ne
                     }
                 };
 
+                // start loading the rows of keys t0 .. t0 + TK - 1 into L1 while the current phase computes
+                auto prefetch_rows = [&](const char * base, int64_t nb, int t0) {
+                    constexpr int NL = RW * 4 / 64 + 1; // cache lines per row
+                    for (int e = tid; e < TK * NL; e += FA_DPAS_WG) {
+                        const int j = t0 + e / NL;
+                        if (j < k_end) {
+                            char * pa = const_cast<char *>(base) + (int64_t) j * nb + (e % NL) * 64;
+                            sycl::ext::oneapi::experimental::prefetch(pa, sycl::ext::oneapi::experimental::properties{ sycl::ext::oneapi::experimental::prefetch_hint_L1 });
+                        }
+                    }
+                };
+
                 for (int t0 = k_begin; t0 < k_end; t0 += TK) {
                     if constexpr (ST) {
                         stage(Kh, p.nb11, t0);
                         it.barrier(sycl::access::fence_space::local_space);
                     }
+                    prefetch_rows(Vh, p.nb21, t0);
 
                     // S = Q K^T, job = (key group, TC row tiles)
                     const int nch = (RT + TC - 1) / TC;
@@ -409,6 +422,8 @@ static void fattn_dpas_q4_0(const fa_dpas_params p, const int nkvh, const int ne
                         }
                     }
                     it.barrier(sycl::access::fence_space::local_space);
+
+                    prefetch_rows(Kh, p.nb11, t0 + TK);
 
                     // O^T = diag(alpha) O^T + V^T P^T. A = V^T (8 dims x 16 keys, lane = key), B = P^T (16 keys x 16 rows)
 #pragma unroll
