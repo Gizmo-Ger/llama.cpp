@@ -197,12 +197,13 @@ struct fa_dpas_params {
 //   per work-group.
 // - online softmax per row, P stored as f16.
 // - O^T += V^T P^T: f16 DPAS, V dequantized in registers. Sub-group w owns head dims D / 16 * w .. D / 16 * (w + 1) - 1.
-// ST: copy each K and V tile to SLM with coalesced 16-byte loads first (single token decode, D 256).
+// ST: copy each K and V tile to SLM first, 1: coalesced 16-byte loads (single token decode, D 256), 2: coalesced dword
+// loads (q8_0, D 128: its 136-byte rows gather poorly per lane).
 // LG: 256-register file. The 32-row launch runs 2 work-groups x 16 sub-groups per Xe core, which is what that mode
 // allows, so it costs no occupancy and removes spills. grf_size_automatic does not pick it for this kernel. Every arch in
 // fattn_dpas_arch_ok() has the large register file.
 // Q8: K/V are q8_0 (else q4_0).
-template <int D, int NR16, int KG, int TC, bool ST, bool LG, bool Q8>
+template <int D, int NR16, int KG, int TC, int ST, bool LG, bool Q8>
 static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int ne03, dpct::queue_ptr stream) {
     constexpr int RMAX  = 16 * NR16;
     constexpr int RTMAX = RMAX / 8;                         // 8-row tiles in Q.K
@@ -218,7 +219,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
     constexpr int RW    = NB * BB / 4;                      // dwords per row
     constexpr int SW    = RW + 1;                           // odd SLM row stride: no bank conflicts for lane = key
     static_assert(D % QK4_0 == 0 && D % DPS == 0 && NPV <= FA_DPAS_NSG && QK4_0 % DPS == 0, "unsupported head size");
-    static_assert(!ST || RW % 4 == 0, "staging needs rows of 16-byte multiples");
+    static_assert(ST != 1 || RW % 4 == 0, "16-byte staging needs rows of 16-byte multiples");
 
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<fa_dpas_short8, 1> sQ8(sycl::range<1>(RTMAX * NB * 16), cgh); // Q s8 [tile][block][lane]
@@ -308,7 +309,16 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
 
                 // keys past k_end repeat key k_begin, their scores are -inf
                 auto stage = [&](const char * base, int64_t nb, int t0) {
-                    constexpr int RV  = RW / 4;
+                    if constexpr (ST == 2) {
+                        for (int e = tid; e < TK * RW; e += FA_DPAS_WG) {
+                            const int key = e / RW;
+                            const int q   = e - key * RW;
+                            const int j   = t0 + key < k_end ? t0 + key : k_begin;
+                            sKV[key * SW + q] = ((const uint32_t *) (base + (int64_t) j * nb))[q];
+                        }
+                        return;
+                    }
+                    constexpr int RV  = ST == 1 ? RW / 4 : 1;
                     constexpr int NV  = TK * RV;
                     constexpr int PER = (NV + FA_DPAS_WG - 1) / FA_DPAS_WG;
                     sycl::uint4 v[PER];
@@ -554,7 +564,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
     });
 }
 
-template <int D, int NR16, int KG, int TC, bool ST, bool Q8>
+template <int D, int NR16, int KG, int TC, int ST, bool Q8>
 static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     constexpr int TK = 16 * KG;
 
@@ -656,7 +666,7 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
 
     // single token decode: staged K/V tiles are faster at long context (B580, 48K keys: 302 -> 247 us per layer)
     if (D == 256 && ne01 == 1 && G <= 16 && aligned16) {
-        fattn_dpas_case<256, 1, 8, 1, true, Q8>(ctx, dst);
+        fattn_dpas_case<256, 1, 8, 1, 1, Q8>(ctx, dst);
         return;
     }
     const bool rows16 = ne01 * G <= 16;
@@ -664,11 +674,25 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
 #define FATTN_DPAS_D(D_, KG16_)                                                                        \
     case D_:                                                                                           \
         if (rows16) {                                                                                  \
-            fattn_dpas_case<D_, 1, KG16_, 1, false, Q8>(ctx, dst);                                     \
+            fattn_dpas_case<D_, 1, KG16_, 1, 0, Q8>(ctx, dst);                                     \
         } else {                                                                                       \
-            fattn_dpas_case<D_, 2, 8, 2, false, Q8>(ctx, dst);                                         \
+            fattn_dpas_case<D_, 2, 8, 2, 0, Q8>(ctx, dst);                                         \
         }                                                                                              \
         break;
+    // q8_0 at head size 128: K/V tiles staged in SLM by coalesced dword loads. B580, Llama 3.1 8B tg128 at 16K / 64K:
+    // 41.0 / 18.8 -> 45.5 / 22.5 t/s. Not for q4_0 (72-byte rows: per-lane reads win, staging -25..-40%) or other sizes.
+    bool aligned4 = true;
+    for (const ggml_tensor * t : { K, V }) {
+        aligned4 = aligned4 && t->nb[1] % 4 == 0 && t->nb[2] % 4 == 0 && t->nb[3] % 4 == 0 && (uintptr_t) t->data % 4 == 0;
+    }
+    if (Q8 && D == 128 && aligned4) {
+        if (rows16) {
+            fattn_dpas_case<128, 1, 16, 1, 2, Q8>(ctx, dst);
+        } else {
+            fattn_dpas_case<128, 2, 8, 2, 2, Q8>(ctx, dst);
+        }
+        return;
+    }
     switch (D) {
         FATTN_DPAS_D( 64, 16)
         FATTN_DPAS_D( 96, 16)
