@@ -217,6 +217,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
     constexpr int XT    = DPS / 8;                          // 8-dim tiles per sub-group in P.V
     constexpr int PS    = TK + 16;                          // f16 row stride of P
     constexpr int RW    = NB * BB / 4;                      // dwords per row
+    constexpr bool ODD  = (NB * BB) % 4 != 0;               // odd block count: rows may start 2 bytes into a dword
     constexpr int SW    = RW + 1;                           // odd SLM row stride: no bank conflicts for lane = key
     static_assert(D % QK4_0 == 0 && D % DPS == 0 && NPV <= FA_DPAS_NSG && QK4_0 % DPS == 0, "unsupported head size");
     static_assert(ST != 1 || RW % 4 == 0, "16-byte staging needs rows of 16-byte multiples");
@@ -392,7 +393,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                         const int  j  = t0 + kg * 16 + lane;
                         const bool jv = j < k_end;
                         const char *     kb = Kh + (int64_t) (jv ? j : k_begin) * p.nb11;
-                        const int        kp = ST ? 0 : (int) (((uintptr_t) kb >> 1) & 1); // row starts 2 bytes into a dword
+                        const int        kp = (ST || !ODD) ? 0 : (int) (((uintptr_t) kb >> 1) & 1); // row starts 2 bytes into a dword
                         const uint32_t * kr = (const uint32_t *) (kb - 2 * kp);
                         fa_dpas_float8 s[TC];
 #pragma unroll
@@ -494,7 +495,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                         const int  j  = t0 + kg * 16 + lane;
                         const bool jv = j < k_end;
                         const char *     vbp = Vh + (int64_t) (jv ? j : k_begin) * p.nb21;
-                        const int        vp  = ST ? 0 : (int) (((uintptr_t) vbp >> 1) & 1);
+                        const int        vp  = (ST || !ODD) ? 0 : (int) (((uintptr_t) vbp >> 1) & 1);
                         const uint32_t * vr  = (const uint32_t *) (vbp - 2 * vp);
                         uint32_t wv[NQ + 1];
                         uint32_t sc;
