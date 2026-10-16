@@ -12224,9 +12224,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
 
     // q4_0 K/V decode: 32 heads / 8 KV heads at head size 128, 24 / 4 at 256
-    for (int kv : { 512, 4096, 16384, 65536 }) {
+    for (int kv : { 512, 4096, 16384, 65536, 131072 }) {
         for (int hs : { 128, 256 }) {
-            for (int nb : { 1, 4 }) {
+            for (int nb : { 1, 4, 8, 16 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(hs, hs, hs == 128 ? 8 : 4, {hs == 128 ? 4 : 6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
             }
         }

@@ -1,4 +1,5 @@
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "dpct/helper.hpp"
 #include "common.hpp"
 #include "fattn-common.hpp"
@@ -171,7 +172,10 @@ struct fa_dpas_params {
 // - online softmax per row, P stored as f16.
 // - O^T += V^T P^T: f16 DPAS, V dequantized in registers. Sub-group w owns head dims D / 16 * w .. D / 16 * (w + 1) - 1.
 // ST: copy each K and V tile to SLM with coalesced 16-byte loads first (single token decode, D 256).
-template <int D, int NR16, int KG, int TC, bool ST>
+// LG: 256-register file. The 32-row launch runs 2 work-groups x 16 sub-groups per Xe core, which is what that mode
+// allows, so it costs no occupancy and removes spills. grf_size_automatic does not pick it for this kernel. Every arch in
+// fattn_dpas_arch_ok() has the large register file.
+template <int D, int NR16, int KG, int TC, bool ST, bool LG>
 static void fattn_dpas_q4_0(const fa_dpas_params p, const int nkvh, const int ne03, dpct::queue_ptr stream) {
     constexpr int RMAX  = 16 * NR16;
     constexpr int RTMAX = RMAX / 8;                         // 8-row tiles in Q.K
@@ -194,10 +198,9 @@ static void fattn_dpas_q4_0(const fa_dpas_params p, const int nkvh, const int ne
         sycl::local_accessor<float, 1>          sL(sycl::range<1>(RMAX), cgh);
         sycl::local_accessor<float, 1>          sA(sycl::range<1>(RMAX), cgh);
         sycl::local_accessor<uint32_t, 1>       sKV(sycl::range<1>(ST ? TK * SW : 1), cgh);
-        cgh.parallel_for(
-            sycl::nd_range<3>(sycl::range<3>((size_t) ne03 * p.nqc, nkvh, (size_t) p.nsplit * FA_DPAS_WG),
-                              sycl::range<3>(1, 1, FA_DPAS_WG)),
-            [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
+        const sycl::nd_range<3> ndr(sycl::range<3>((size_t) ne03 * p.nqc, nkvh, (size_t) p.nsplit * FA_DPAS_WG),
+                                    sycl::range<3>(1, 1, FA_DPAS_WG));
+        auto kern = [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
                 const int tid   = it.get_local_id(2);
                 const int split = it.get_group(2);
                 const int kvh   = it.get_group(1);
@@ -493,7 +496,12 @@ static void fattn_dpas_q4_0(const fa_dpas_params p, const int nkvh, const int ne
                     const int64_t jdu = ((int64_t) seq * p.ne01 + c0 + tid / G) * p.ne02 + kvh * G + tid % G;
                     p.meta[jdu * p.nsplit + split] = sycl::float2(sM[tid], sL[tid]);
                 }
-            });
+            };
+        if constexpr (LG) {
+            cgh.parallel_for(ndr, sycl::ext::oneapi::experimental::properties{ sycl::ext::intel::experimental::grf_size<256> }, kern);
+        } else {
+            cgh.parallel_for(ndr, kern);
+        }
     });
 }
 
@@ -557,7 +565,13 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
     p.meta  = meta.get();
 
     dpct::queue_ptr stream = ctx.stream();
-    fattn_dpas_q4_0<D, NR16, KG, TC, ST>(p, nkvh, ne03, stream);
+    // B580, us, 4 / 8 / 16 tokens: D 256 G 6 at 128K keys 1281 / 2460 / 6077 -> 1209 / 2300 / 5757,
+    // D 128 G 4 (8 / 16 tokens) 2429 / 5483 -> 2098 / 4754. Below ~4K keys the launch overhead wins (512 keys: 16 -> 19).
+    if (NR16 == 2 && ne11 >= 4096) {
+        fattn_dpas_q4_0<D, NR16, KG, TC, ST, true>(p, nkvh, ne03, stream);
+    } else {
+        fattn_dpas_q4_0<D, NR16, KG, TC, ST, false>(p, nkvh, ne03, stream);
+    }
 
     if (nsplit > 1) {
         float *        parts_p = parts.get();
