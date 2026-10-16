@@ -11750,7 +11750,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // FLASH_ATTN_EXT: q4_0 / q8_0 K/V, decode and small batches
     for (ggml_type kvt : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
-        for (int hs : { 128, 256, 512 }) {
+        for (int hs : { 64, 96, 128, 192, 256, 512 }) {
             for (int nr2 : { 1, 4, 6, 32 }) {
                 const int nh = nr2 == 32 ? 1 : 4;
                 for (int nb : { 1, 2, 5, 8, 31 }) {
@@ -11763,6 +11763,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {4, 1}, 512, 3, false, false, 0, 0, GGML_PREC_F32, kvt, kvt));
             test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {4, 1}, 512, 3, true,  false, 0, 0, GGML_PREC_F32, kvt, kvt, {0, 2, 1, 3}));
             test_cases.emplace_back(new test_flash_attn_ext_large_logits(hs, hs, 4, {6, 1}, 1024, 5, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
+            for (int nb : { 1, 3 }) { // attention sinks (gpt-oss: head size 64, 8 query heads per KV head), several key slices
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 1}, 4100, nb, true, true, 0, 0, GGML_PREC_F32, kvt, kvt));
+                test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 2, {8, 1}, 113,  nb, true, true, 0, 0, GGML_PREC_F32, kvt, kvt));
+            }
         }
     }
 
@@ -12232,6 +12236,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 for (int nb : { 1, 4 }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, hs == 128 ? 8 : 4, {hs == 128 ? 4 : 6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
                 }
+            }
+        }
+    }
+
+    // q4_0 / q8_0 K/V decode: head size 64 with sinks and 8 query heads per KV head (gpt-oss), 96 with 1 (Phi-3 mini)
+    for (ggml_type kvt : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+        for (int kv : { 4096, 16384, 65536 }) {
+            for (int nb : { 1, 4 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, kvt, kvt));
+                test_cases.emplace_back(new test_flash_attn_ext(96, 96, 32, {1, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
             }
         }
     }
