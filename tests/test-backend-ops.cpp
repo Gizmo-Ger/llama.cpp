@@ -11750,7 +11750,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // FLASH_ATTN_EXT: q4_0 / q8_0 K/V, decode and small batches
     for (ggml_type kvt : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
-        for (int hs : { 128, 256 }) {
+        for (int hs : { 128, 256, 512 }) {
             for (int nr2 : { 1, 4, 6, 32 }) {
                 const int nh = nr2 == 32 ? 1 : 4;
                 for (int nb : { 1, 2, 5, 8, 31 }) {
@@ -12232,6 +12232,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 for (int nb : { 1, 4 }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, hs == 128 ? 8 : 4, {hs == 128 ? 4 : 6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
                 }
+            }
+        }
+    }
+
+    // q4_0 / q8_0 K/V decode at head size 512 with 16 query heads per KV head (Gemma 4 global-attention layers)
+    for (ggml_type kvt : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int kv : { 4096, 16384, 65536 }) {
+            for (int nb : { 1, 4 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, kvt, kvt));
             }
         }
     }
