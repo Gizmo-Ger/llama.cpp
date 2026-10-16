@@ -76,10 +76,11 @@ bool ggml_sycl_flash_attn_ext_dpas_supported(int device, const ggml_tensor * dst
     if (Q->nb[0] != sizeof(float)) {
         return false;
     }
-    // q4_0 / q8_0 rows are read as dwords
+    // q4_0 / q8_0 rows are read as dwords from the dword at or before the row start: rows must start on 2-byte bounds
+    // (head sizes with an odd block count, e.g. 96, put every other head 2 bytes into a dword)
     for (const ggml_tensor * t : { K, V }) {
-        if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 4 != 0 || t->nb[2] % 4 != 0 || t->nb[3] % 4 != 0 ||
-            (uintptr_t) t->data % 4 != 0) {
+        if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 2 != 0 || t->nb[2] % 2 != 0 || t->nb[3] % 2 != 0 ||
+            (uintptr_t) t->data % 2 != 0) {
             return false;
         }
     }
@@ -336,9 +337,9 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                     }
                 };
 
-                // the NQ + 1 dwords of block b: of tile key kk in SLM, or of row in memory
-                auto load_block = [&](const uint32_t * row, int kk, int b, uint32_t * wv) {
-                    const int wd = BB * b / 4;
+                // the NQ + 1 dwords of block b: of tile key kk in SLM, or of a row that starts 2 ph bytes into dword row[0]
+                auto load_block = [&](const uint32_t * row, int ph, int kk, int b, uint32_t * wv) {
+                    const int wd = (2 * ph + BB * b) / 4;
                     if constexpr (ST) {
                         GGML_UNUSED(row);
 #pragma unroll
@@ -380,7 +381,9 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                         const int  ch = job / KG;
                         const int  j  = t0 + kg * 16 + lane;
                         const bool jv = j < k_end;
-                        const uint32_t * kr = (const uint32_t *) (Kh + (int64_t) (jv ? j : k_begin) * p.nb11);
+                        const char *     kb = Kh + (int64_t) (jv ? j : k_begin) * p.nb11;
+                        const int        kp = ST ? 0 : (int) (((uintptr_t) kb >> 1) & 1); // row starts 2 bytes into a dword
+                        const uint32_t * kr = (const uint32_t *) (kb - 2 * kp);
                         fa_dpas_float8 s[TC];
 #pragma unroll
                         for (int tt = 0; tt < TC; ++tt) {
@@ -391,8 +394,8 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                             uint32_t wv[NQ + 1];
                             uint32_t sc;
                             uint32_t q[NQ];
-                            load_block(kr, kg * 16 + lane, b, wv);
-                            fa_dpas_split_block<NQ>(wv, b % 2 != 0, sc, q);
+                            load_block(kr, kp, kg * 16 + lane, b, wv);
+                            fa_dpas_split_block<NQ>(wv, (b + kp) % 2 != 0, sc, q);
                             const float dk = static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc));
 #pragma unroll
                             for (int tt = 0; tt < TC; ++tt) {
@@ -480,12 +483,14 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                     for (int kg = 0; kg < (w < NPV ? KG : 0); ++kg) {
                         const int  j  = t0 + kg * 16 + lane;
                         const bool jv = j < k_end;
-                        const uint32_t * vr = (const uint32_t *) (Vh + (int64_t) (jv ? j : k_begin) * p.nb21);
+                        const char *     vbp = Vh + (int64_t) (jv ? j : k_begin) * p.nb21;
+                        const int        vp  = ST ? 0 : (int) (((uintptr_t) vbp >> 1) & 1);
+                        const uint32_t * vr  = (const uint32_t *) (vbp - 2 * vp);
                         uint32_t wv[NQ + 1];
                         uint32_t sc;
                         uint32_t q[NQ];
-                        load_block(vr, kg * 16 + lane, vb, wv);
-                        fa_dpas_split_block<NQ>(wv, vb % 2 != 0, sc, q);
+                        load_block(vr, vp, kg * 16 + lane, vb, wv);
+                        fa_dpas_split_block<NQ>(wv, (vb + vp) % 2 != 0, sc, q);
                         const float dv = jv ? static_cast<float>(sycl::bit_cast<sycl::half>((uint16_t) sc)) : 0.0f;
                         fa_dpas_short8 va[XT];
 #pragma unroll
