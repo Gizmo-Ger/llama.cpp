@@ -214,6 +214,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
     constexpr int NB    = D / QK4_0;                        // blocks per row
     constexpr int DPS   = D <= 128 ? 8 : D <= 256 ? 16 : 32; // head dims per sub-group in P.V, inside one 32-dim block
     constexpr int NPV   = D / DPS;                          // sub-groups doing P.V, the rest only reach its barrier
+    constexpr bool ALLPV = NPV == FA_DPAS_NSG;              // every sub-group does P.V: no runtime check in the loops
     constexpr int XT    = DPS / 8;                          // 8-dim tiles per sub-group in P.V
     constexpr int PS    = TK + 16;                          // f16 row stride of P
     constexpr int RW    = NB * BB / 4;                      // dwords per row
@@ -491,7 +492,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                         }
                     }
 #pragma unroll 1
-                    for (int kg = 0; kg < (w < NPV ? KG : 0); ++kg) {
+                    for (int kg = 0; kg < ((ALLPV || w < NPV) ? KG : 0); ++kg) {
                         const int  j  = t0 + kg * 16 + lane;
                         const bool jv = j < k_end;
                         const char *     vbp = Vh + (int64_t) (jv ? j : k_begin) * p.nb21;
@@ -535,7 +536,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                 for (int t = 0; t < NR16; ++t) {
                     const int r = t * 16 + lane;
                     const int c = c0 + r / G;
-                    if (w < NPV && r < R && c < p.ne01) {
+                    if ((ALLPV || w < NPV) && r < R && c < p.ne01) {
                         const int64_t jdu = ((int64_t) seq * p.ne01 + c) * p.ne02 + kvh * G + r % G;
                         const float   l   = sL[r];
 #pragma unroll
