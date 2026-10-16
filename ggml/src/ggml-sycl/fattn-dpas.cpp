@@ -43,7 +43,7 @@ bool ggml_sycl_flash_attn_ext_dpas_supported(int device, const ggml_tensor * dst
     if (Q->type != GGML_TYPE_F32 || (K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0) || V->type != K->type || sinks) {
         return false;
     }
-    if ((K->ne[0] != 128 && K->ne[0] != 256) || V->ne[0] != K->ne[0] || Q->ne[0] != K->ne[0]) {
+    if ((K->ne[0] != 128 && K->ne[0] != 256 && K->ne[0] != 512) || V->ne[0] != K->ne[0] || Q->ne[0] != K->ne[0]) {
         return false;
     }
     if (Q->ne[1] < 1 || Q->ne[1] > FA_DPAS_MAX_Q || K->ne[1] < 1) {
@@ -208,7 +208,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
     constexpr int PS    = TK + 16;                          // f16 row stride of P
     constexpr int RW    = NB * BB / 4;                      // dwords per row
     constexpr int SW    = RW + 1;                           // odd SLM row stride: no bank conflicts for lane = key
-    static_assert((D == 128 || D == 256) && DPS % 8 == 0 && QK4_0 % DPS == 0, "unsupported head size");
+    static_assert((D == 128 || D == 256 || D == 512) && DPS % 8 == 0 && QK4_0 % DPS == 0, "unsupported head size");
     static_assert(!ST || RW % 4 == 0, "staging needs rows of 16-byte multiples");
 
     stream->submit([&](sycl::handler & cgh) {
@@ -649,6 +649,13 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
             fattn_dpas_case<128, 1, 16, 1, false, Q8>(ctx, dst);
         } else {
             fattn_dpas_case<128, 2, 8, 2, false, Q8>(ctx, dst);
+        }
+    } else if (D == 512) {
+        // 32 head dims per sub-group in P V; tiles of 128 keys keep S and the Q copy in SLM within 2 work-groups per core
+        if (rows16) {
+            fattn_dpas_case<512, 1, 8, 1, false, Q8>(ctx, dst);
+        } else {
+            fattn_dpas_case<512, 2, 8, 2, false, Q8>(ctx, dst);
         }
     } else {
         if (rows16) {
