@@ -98,7 +98,7 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE     =   0,
     BEST_FATTN_KERNEL_VEC      = 100,
-    BEST_FATTN_KERNEL_DPAS     = 120, // q4_0 K/V decode on Xe2 XMX
+    BEST_FATTN_KERNEL_DPAS     = 120, // q4_0 / q8_0 K/V decode on Xe2 XMX
     BEST_FATTN_KERNEL_ONEDNN   = 150, // oneDNN SDPA: native F16 (PR #25222)
     BEST_FATTN_KERNEL_TILE     = 200,
     BEST_FATTN_KERNEL_MKL      = 300,
@@ -246,7 +246,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // q4_0 K/V decode and small batches on Xe2: read the cache directly, no F16 copy of K and V
+    // q4_0 / q8_0 K/V decode and small batches on Xe2: read the cache directly, no F16 copy of K and V
     if (ggml_sycl_flash_attn_ext_dpas_supported(device, dst)) {
         return BEST_FATTN_KERNEL_DPAS;
     }
