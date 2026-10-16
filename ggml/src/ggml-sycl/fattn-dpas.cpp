@@ -24,6 +24,11 @@ static bool fattn_dpas_arch_ok(gpu_arch arch) {
            arch == gpu_arch::intel_gpu_ptl_u   || arch == gpu_arch::intel_gpu_wcl;
 }
 
+// head sizes with a compiled kernel (multiples of the 32-dim q4_0 / q8_0 block)
+static bool fattn_dpas_head_ok(int64_t d) {
+    return d == 64 || d == 96 || d == 128 || d == 192 || d == 256 || d == 512;
+}
+
 bool ggml_sycl_flash_attn_ext_dpas_supported(int device, const ggml_tensor * dst) {
 #if !GGML_SYCL_FA_DPAS_BUILD
     GGML_UNUSED(device);
@@ -40,10 +45,11 @@ bool ggml_sycl_flash_attn_ext_dpas_supported(int device, const ggml_tensor * dst
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
-    if (Q->type != GGML_TYPE_F32 || (K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0) || V->type != K->type || sinks) {
+    if (Q->type != GGML_TYPE_F32 || (K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0) || V->type != K->type ||
+        (sinks && sinks->type != GGML_TYPE_F32)) {
         return false;
     }
-    if ((K->ne[0] != 128 && K->ne[0] != 256 && K->ne[0] != 512) || V->ne[0] != K->ne[0] || Q->ne[0] != K->ne[0]) {
+    if (!fattn_dpas_head_ok(K->ne[0]) || V->ne[0] != K->ne[0] || Q->ne[0] != K->ne[0]) {
         return false;
     }
     if (Q->ne[1] < 1 || Q->ne[1] > FA_DPAS_MAX_Q || K->ne[1] < 1) {
@@ -167,6 +173,7 @@ struct fa_dpas_params {
     float *        parts;  // per-split partial results, nsplit > 1 only
     sycl::float2 * meta;   // per-split (max, sum), nsplit > 1 only
     float          scale;
+    const float *  sinks;  // per query head softmax sink logit, or null
     int            G;      // query heads per KV head
     int            nq;     // query tokens per work-group
     int            nqc;    // token chunks
@@ -203,12 +210,13 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
     constexpr int BB    = Q8 ? (int) sizeof(block_q8_0) : (int) sizeof(block_q4_0); // bytes per block
     constexpr int NQ    = (BB - 2) / 4;                     // quant dwords per block
     constexpr int NB    = D / QK4_0;                        // blocks per row
-    constexpr int DPS   = D / FA_DPAS_NSG;                  // head dims per sub-group in P.V
+    constexpr int DPS   = D <= 128 ? 8 : D <= 256 ? 16 : 32; // head dims per sub-group in P.V, inside one 32-dim block
+    constexpr int NPV   = D / DPS;                          // sub-groups doing P.V, the rest only reach its barrier
     constexpr int XT    = DPS / 8;                          // 8-dim tiles per sub-group in P.V
     constexpr int PS    = TK + 16;                          // f16 row stride of P
     constexpr int RW    = NB * BB / 4;                      // dwords per row
     constexpr int SW    = RW + 1;                           // odd SLM row stride: no bank conflicts for lane = key
-    static_assert((D == 128 || D == 256 || D == 512) && DPS % 8 == 0 && QK4_0 % DPS == 0, "unsupported head size");
+    static_assert(D % QK4_0 == 0 && D % DPS == 0 && NPV <= FA_DPAS_NSG && QK4_0 % DPS == 0, "unsupported head size");
     static_assert(!ST || RW % 4 == 0, "staging needs rows of 16-byte multiples");
 
     stream->submit([&](sycl::handler & cgh) {
@@ -270,8 +278,10 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                     sPs[e] = 0;
                 }
                 if (tid < RMAX) {
-                    sM[tid] = FA_DPAS_MINF;
-                    sL[tid] = 0.0f;
+                    // the sink is one more key with logit sinks[head] and no value; the first key slice owns it
+                    const bool sink = p.sinks && split == 0 && tid < R;
+                    sM[tid] = sink ? p.sinks[kvh * G + tid % G] : FA_DPAS_MINF;
+                    sL[tid] = sink ? 1.0f : 0.0f;
                     sA[tid] = 1.0f;
                 }
                 it.barrier(sycl::access::fence_space::local_space);
@@ -467,7 +477,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                         }
                     }
 #pragma unroll 1
-                    for (int kg = 0; kg < KG; ++kg) {
+                    for (int kg = 0; kg < (w < NPV ? KG : 0); ++kg) {
                         const int  j  = t0 + kg * 16 + lane;
                         const bool jv = j < k_end;
                         const uint32_t * vr = (const uint32_t *) (Vh + (int64_t) (jv ? j : k_begin) * p.nb21);
@@ -509,7 +519,7 @@ static void fattn_dpas_kernel(const fa_dpas_params p, const int nkvh, const int 
                 for (int t = 0; t < NR16; ++t) {
                     const int r = t * 16 + lane;
                     const int c = c0 + r / G;
-                    if (r < R && c < p.ne01) {
+                    if (w < NPV && r < R && c < p.ne01) {
                         const int64_t jdu = ((int64_t) seq * p.ne01 + c) * p.ne02 + kvh * G + r % G;
                         const float   l   = sL[r];
 #pragma unroll
@@ -558,6 +568,7 @@ static void fattn_dpas_case(ggml_backend_sycl_context & ctx, ggml_tensor * dst) 
     p.K    = (const char *) K->data;
     p.V    = (const char *) V->data;
     p.mask = mask ? (const char *) mask->data : nullptr;
+    p.sinks = dst->src[4] ? (const float *) dst->src[4]->data : nullptr;
     p.dst  = (float *) dst->data;
     memcpy(&p.scale, (const float *) dst->op_params + 0, sizeof(float));
     p.G    = Q->ne[2] / K->ne[2];
@@ -644,26 +655,26 @@ template <bool Q8> static void fattn_dpas_dispatch(ggml_backend_sycl_context & c
         return;
     }
     const bool rows16 = ne01 * G <= 16;
-    if (D == 128) {
-        if (rows16) {
-            fattn_dpas_case<128, 1, 16, 1, false, Q8>(ctx, dst);
-        } else {
-            fattn_dpas_case<128, 2, 8, 2, false, Q8>(ctx, dst);
-        }
-    } else if (D == 512) {
-        // 32 head dims per sub-group in P V; tiles of 128 keys keep S and the Q copy in SLM within 2 work-groups per core
-        if (rows16) {
-            fattn_dpas_case<512, 1, 8, 1, false, Q8>(ctx, dst);
-        } else {
-            fattn_dpas_case<512, 2, 8, 2, false, Q8>(ctx, dst);
-        }
-    } else {
-        if (rows16) {
-            fattn_dpas_case<256, 1, 16, 1, false, Q8>(ctx, dst);
-        } else {
-            fattn_dpas_case<256, 2, 8, 2, false, Q8>(ctx, dst);
-        }
+    // 256-key tiles for one row tile; 128 at head size 512 so S and the Q copy stay in SLM for the planned waves
+#define FATTN_DPAS_D(D_, KG16_)                                                                        \
+    case D_:                                                                                           \
+        if (rows16) {                                                                                  \
+            fattn_dpas_case<D_, 1, KG16_, 1, false, Q8>(ctx, dst);                                     \
+        } else {                                                                                       \
+            fattn_dpas_case<D_, 2, 8, 2, false, Q8>(ctx, dst);                                         \
+        }                                                                                              \
+        break;
+    switch (D) {
+        FATTN_DPAS_D( 64, 16)
+        FATTN_DPAS_D( 96, 16)
+        FATTN_DPAS_D(128, 16)
+        FATTN_DPAS_D(192, 16)
+        FATTN_DPAS_D(256, 16)
+        FATTN_DPAS_D(512, 8)
+        default:
+            GGML_ABORT("fattn-dpas: unsupported head size %d", D);
     }
+#undef FATTN_DPAS_D
 }
 
 void ggml_sycl_flash_attn_ext_dpas(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
