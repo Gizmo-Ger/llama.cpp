@@ -2997,10 +2997,22 @@ inline void ggml_sycl_op_mul_mat_sycl(
                 GGML_ASSERT(extra->w4_scales_t != nullptr);
                 ggml_sycl_q4_0_w4_scales_t(d_rows, (sycl::half *) extra->w4_scales_t, row_diff, ne00, stream);
             }
-            ggml_sycl_pool_alloc<sycl::half> act(ctx.pool(), src1_ncols * ne10);
-            ggml_sycl_q4_0_w4_prep(src1_ddf_i, act.get(), ne00, src1_ncols, q4, stream);
+            const int64_t n_act = src1_ncols * ne10;
+            if (!(ctx.w4_act_src == src1 && ctx.w4_act_data == src1_ddf_i && ctx.w4_act_n == n_act && ctx.w4_act_perm == q4)) {
+                if ((size_t) n_act > ctx.w4_act_cap) {
+                    if (ctx.w4_act_buf != nullptr) {
+                        stream->wait();   // earlier GEMMs may still read the old buffer
+                        sycl::free(ctx.w4_act_buf, *stream);
+                    }
+                    ctx.w4_act_buf = sycl::malloc_device<sycl::half>(n_act, *stream);
+                    GGML_ASSERT(ctx.w4_act_buf != nullptr);
+                    ctx.w4_act_cap = n_act;
+                }
+                ggml_sycl_q4_0_w4_prep(src1_ddf_i, (sycl::half *) ctx.w4_act_buf, ne00, src1_ncols, q4, stream);
+                ctx.w4_act_src = src1; ctx.w4_act_data = src1_ddf_i; ctx.w4_act_n = n_act; ctx.w4_act_perm = q4;
+            }
             DnnlGemmWrapper::q4_0_w4_gemm(ctx, row_diff, src1_ncols, ne00, src0_dd_i, (const sycl::half *) extra->w4_scales_t,
-                                          act.get(), dst_dd_i, q4, stream);
+                                          (const sycl::half *) ctx.w4_act_buf, dst_dd_i, q4, stream);
             GGML_UNUSED(src1_ddq_i);
             GGML_UNUSED(src1_padded_row_size);
             return;
@@ -7399,6 +7411,7 @@ static bool ggml_sycl_same_or_disjoint(const ggml_tensor * out, const ggml_tenso
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
     ggml_sycl_gdn_gather_reset(*sycl_ctx);
+    sycl_ctx->w4_act_src = nullptr;   // new graph: src1 contents may have changed
     // ARC-LAB: nodes already computed by ggml_sycl_try_ptq1_multi, and staged outputs still to copy in
     std::vector<uint8_t>      done(cgraph->n_nodes, 0);
     std::vector<const void *> pending(cgraph->n_nodes, nullptr);
@@ -7455,6 +7468,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (ot_on) {
             ot_mark(sycl_op_timing::label(node));
+        }
+        if (node->op != GGML_OP_MUL_MAT) {
+            sycl_ctx->w4_act_src = nullptr;   // reuse converted activations only across back-to-back MUL_MATs
         }
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
