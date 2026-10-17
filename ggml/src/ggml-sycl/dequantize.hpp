@@ -817,62 +817,50 @@ static void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restri
     }
 }
 
+// Dequantize Q4_0 from the reorder layout: [all qs (k/2 bytes)][all d values].
+// Each work-item reads one 32-bit word (8 values) so that a sub-group reads and writes contiguous memory.
 template<typename dst_t>
-static void dequantize_block_q4_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
-                                  const sycl::nd_item<3> &item_ct1) {
-
-    const int64_t i = item_ct1.get_group(2);
-    auto k=nb32;
-    // assume 32 threads
-    const int64_t tid = item_ct1.get_local_id(2);
-    const int lane_ib = i * WARP_SIZE + tid;
-
-    if (lane_ib >= k / QK4_0) {
+static void dequantize_block_q4_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
+                                          const sycl::nd_item<1> & item_ct1) {
+    const int64_t g = item_ct1.get_global_id(0);
+    if (g >= k / 8) {
         return;
     }
 
-    dst_t * y_ptr = yy + lane_ib * QK4_0;
+    const int64_t ib = g / 4;      // block
+    const int     j  = (g % 4) * 4; // first of the 4 bytes of the block this item reads
 
-    auto qs = (const uint8_t*)vx + lane_ib * QK4_0 / 2;
-    auto s_ptr = (const sycl::half*)((const uint8_t*)vx + k / 2) + lane_ib;
+    const uint32_t q = *((const uint32_t *) vx + g);
+    const float    d = float(*((const sycl::half *) ((const uint8_t *) vx + k / 2) + ib));
 
-    const float d = float(*s_ptr);
-
+    dst_t * y = yy + ib * QK4_0 + j;
 #pragma unroll
-    for (int l = 0; l < QK4_0 / 2; ++l) {
-        int vq = qs[l];
-        y_ptr[l + 0] = d * ((vq & 0xF) - 8);
-        y_ptr[l + 16] = d * ((vq >> 4) - 8);
+    for (int l = 0; l < 4; ++l) {
+        y[l]      = d * ((int) ((q >> (8 * l)) & 0xF) - 8);
+        y[l + 16] = d * ((int) ((q >> (8 * l + 4)) & 0xF) - 8);
     }
-
 }
 
-// Dequantize Q8_0 from reorder layout: [all qs (k bytes)][all d values]
-// Each thread handles one block of QK8_0 elements.
+// Dequantize Q8_0 from the reorder layout: [all qs (k bytes)][all d values].
+// Each work-item reads one 32-bit word (4 values) so that a sub-group reads and writes contiguous memory.
 template<typename dst_t>
 static void dequantize_block_q8_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
-                                  const sycl::nd_item<3> &item_ct1) {
-
-    const int64_t i = item_ct1.get_group(2);
-    const int64_t tid = item_ct1.get_local_id(2);
-    const int lane_ib = i * WARP_SIZE + tid;
-
-    if (lane_ib >= k / QK8_0) {
+                                          const sycl::nd_item<1> & item_ct1) {
+    const int64_t g = item_ct1.get_global_id(0);
+    if (g >= k / 4) {
         return;
     }
 
-    dst_t * y_ptr = yy + lane_ib * QK8_0;
+    const int64_t ib = g / (QK8_0 / 4);
 
-    auto qs = (const int8_t*)vx + lane_ib * QK8_0;
-    auto s_ptr = (const sycl::half*)((const uint8_t*)vx + k) + lane_ib;
+    const int8_t * q = (const int8_t *) vx + g * 4;
+    const float    d = float(*((const sycl::half *) ((const uint8_t *) vx + k) + ib));
 
-    const float d = float(*s_ptr);
-
+    dst_t * y = yy + g * 4;
 #pragma unroll
-    for (int l = 0; l < QK8_0; ++l) {
-        y_ptr[l] = d * qs[l];
+    for (int l = 0; l < 4; ++l) {
+        y[l] = d * q[l];
     }
-
 }
 
 template<typename dst_t>
