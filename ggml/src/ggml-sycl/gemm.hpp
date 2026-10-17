@@ -95,6 +95,12 @@ public:
         const auto c_md = dnnl::memory::desc({ n, m }, dt::f32, tag::ab);
         dnnl::primitive_attr attr;
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        // up to ~1024 weight rows oneDNN picks split-K kernels whose partial sums land in run-dependent order (last-bit
+        // differences, e.g. Gemma 4's 512-row K projection); deterministic mode there keeps results reproducible.
+        // Larger shapes are already bit-reproducible and some get slower kernels in deterministic mode.
+        if (m <= 1024) {
+            attr.set_deterministic(true);
+        }
         attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { 32, 1 }, dt::f16);
         if (q4) {
             attr.set_zero_points(DNNL_ARG_WEIGHTS, 0, {}, dt::u8);

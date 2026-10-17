@@ -98,6 +98,9 @@ int g_ggml_sycl_enable_optimize = 1;
 int g_ggml_sycl_enable_graph = 0;
 int g_ggml_sycl_enable_dnn = 1;
 int g_ggml_sycl_q4_0_w4 = 1;
+int g_ggml_sycl_w4_act_reuse = 1;          // reuse converted activations across back-to-back MUL_MATs on one src1
+int64_t g_ggml_sycl_w4_scale_cache_mb = 512;  // budget for per-tensor transposed scales; past it, transpose per call
+static int64_t g_ggml_sycl_w4_scale_cache_used = 0;
 int g_ggml_sycl_fa_onednn = 1;
 int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
@@ -420,6 +423,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
         g_ggml_sycl_q4_0_w4 = ggml_sycl_get_env("GGML_SYCL_Q4_0_W4", 1);
+        g_ggml_sycl_w4_act_reuse = ggml_sycl_get_env("GGML_SYCL_W4_ACT_REUSE", 1);
+        g_ggml_sycl_w4_scale_cache_mb = ggml_sycl_get_env("GGML_SYCL_W4_SCALE_CACHE_MB", 512);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
@@ -3233,15 +3238,27 @@ inline void ggml_sycl_op_mul_mat_sycl(
         }
         if (extra->optimized_feature.reorder) {
             const bool q4 = src0->type == GGML_TYPE_Q4_0;
-            if (extra->w4_scales_t == nullptr) {
-                const sycl::half * d_rows = (const sycl::half *) ((const uint8_t *) src0_dd_i + row_diff * ne00 / (q4 ? 2 : 1));
-                extra->w4_scales_t   = sycl::malloc_device<sycl::half>(row_diff * (ne00 / QK4_0), *stream);
+            const sycl::half * d_rows = (const sycl::half *) ((const uint8_t *) src0_dd_i + row_diff * ne00 / (q4 ? 2 : 1));
+            const int64_t n_scales = row_diff * (ne00 / QK4_0);
+            if (extra->w4_scales_t == nullptr &&
+                g_ggml_sycl_w4_scale_cache_used + n_scales * 2 <= g_ggml_sycl_w4_scale_cache_mb * 1024 * 1024) {
+                extra->w4_scales_t   = sycl::malloc_device<sycl::half>(n_scales, *stream);
                 extra->w4_scales_t_q = stream;
                 GGML_ASSERT(extra->w4_scales_t != nullptr);
+                g_ggml_sycl_w4_scale_cache_used += n_scales * 2;
                 ggml_sycl_q4_0_w4_scales_t(d_rows, (sycl::half *) extra->w4_scales_t, row_diff, ne00, stream);
             }
+            // over the cache budget: transpose into a pool buffer for this call only
+            ggml_sycl_pool_alloc<sycl::half> d_t_call(ctx.pool());
+            const sycl::half * d_t = (const sycl::half *) extra->w4_scales_t;
+            if (d_t == nullptr) {
+                d_t_call.alloc(n_scales);
+                ggml_sycl_q4_0_w4_scales_t(d_rows, d_t_call.get(), row_diff, ne00, stream);
+                d_t = d_t_call.get();
+            }
             const int64_t n_act = src1_ncols * ne10;
-            if (!(ctx.w4_act_src == src1 && ctx.w4_act_data == src1_ddf_i && ctx.w4_act_n == n_act && ctx.w4_act_perm == q4)) {
+            if (!(g_ggml_sycl_w4_act_reuse && ctx.w4_act_src == src1 && ctx.w4_act_data == src1_ddf_i && ctx.w4_act_n == n_act &&
+                  ctx.w4_act_perm == q4)) {
                 if ((size_t) n_act > ctx.w4_act_cap) {
                     if (ctx.w4_act_buf != nullptr) {
                         stream->wait();   // earlier GEMMs may still read the old buffer
@@ -3254,7 +3271,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
                 ggml_sycl_q4_0_w4_prep(src1_ddf_i, (sycl::half *) ctx.w4_act_buf, ne00, src1_ncols, q4, stream);
                 ctx.w4_act_src = src1; ctx.w4_act_data = src1_ddf_i; ctx.w4_act_n = n_act; ctx.w4_act_perm = q4;
             }
-            DnnlGemmWrapper::q4_0_w4_gemm(ctx, row_diff, src1_ncols, ne00, src0_dd_i, (const sycl::half *) extra->w4_scales_t,
+            DnnlGemmWrapper::q4_0_w4_gemm(ctx, row_diff, src1_ncols, ne00, src0_dd_i, d_t,
                                           (const sycl::half *) ctx.w4_act_buf, dst_dd_i, q4, stream);
             GGML_UNUSED(src1_ddq_i);
             GGML_UNUSED(src1_padded_row_size);
