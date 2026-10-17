@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -118,6 +119,12 @@ bool ggml_sycl_flash_attn_ext_onednn_supported(const ggml_tensor * dst) {
 using namespace dnnl;
 using namespace dnnl::graph;
 
+// GGML_SYCL_SDPA_VEC=0 turns the vectorised conversions below off (A/B switch)
+static bool ggml_sycl_sdpa_vec() {
+    static const bool on = [] { const char * e = std::getenv("GGML_SYCL_SDPA_VEC"); return e == nullptr || std::atoi(e) != 0; }();
+    return on;
+}
+
 // strided src (f16 or f32) -> contiguous f16 [ne0,ne1,ne2,ne3] (ne0 innermost). nb* are BYTE strides.
 // 8 elements per work-item with 16-byte loads/stores when ne0 % 8 == 0 and everything is 16-byte aligned.
 template <typename src_t>
@@ -125,7 +132,7 @@ static void cont_to_f16_sycl(const char * src, sycl::half * dst,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
         size_t nb1, size_t nb2, size_t nb3, dpct::queue_ptr stream) {
     const int64_t n = ne0 * ne1 * ne2 * ne3;
-    if (ne0 % 8 == 0 && ((uintptr_t) src | (uintptr_t) dst | nb1 | nb2 | nb3) % 16 == 0) {
+    if (ggml_sycl_sdpa_vec() && ne0 % 8 == 0 && ((uintptr_t) src | (uintptr_t) dst | nb1 | nb2 | nb3) % 16 == 0) {
         const int64_t n8 = n / 8;
         stream->parallel_for(sycl::nd_range<1>((n8 + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
             const int64_t g = it.get_global_id(0);
@@ -168,7 +175,7 @@ static void cont_to_f16_sycl(const char * src, sycl::half * dst,
 static void permute_sdpa_out_sycl(const sycl::half * out, float * dst,
         int64_t mb, int64_t H, int64_t q, int64_t d, dpct::queue_ptr stream) {
     const int64_t n = mb * H * q * d;
-    if (d % 8 == 0 && ((uintptr_t) out | (uintptr_t) dst) % 16 == 0) {
+    if (ggml_sycl_sdpa_vec() && d % 8 == 0 && ((uintptr_t) out | (uintptr_t) dst) % 16 == 0) {
         const int64_t n8 = n / 8;
         stream->parallel_for(sycl::nd_range<1>((n8 + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
             const int64_t g = it.get_global_id(0);
