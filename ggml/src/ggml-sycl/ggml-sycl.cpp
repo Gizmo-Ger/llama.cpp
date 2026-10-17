@@ -3108,8 +3108,10 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream);
 // in the low nibble, element i+16 in the high one) are read by oneDNN as a u4 [k][rows] matrix (tag ba) with zero point 8
 // and one f16 scale per 32 values. The activations are converted to f16 in the same nibble order (32-value block j ->
 // element j/2 + 16*(j%2)) and the scales are transposed to the [k/32][rows] order oneDNN wants (tag ab).
+// q8_0 takes the same route with its reorder layout ([rows][k] int8, then the scales) read as s8, no zero point and no
+// element permutation.
 static void ggml_sycl_q4_0_w4_prep(const float * src1, sycl::half * act, const sycl::half * d_rows, sycl::half * d_t,
-                                   int64_t rows, int64_t k, int64_t ncols, dpct::queue_ptr stream) {
+                                   int64_t rows, int64_t k, int64_t ncols, bool perm, dpct::queue_ptr stream) {
     const int64_t nact = ncols * k;
     stream->parallel_for(sycl::nd_range<1>((nact + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
         const int64_t i = it.get_global_id(0);
@@ -3117,7 +3119,7 @@ static void ggml_sycl_q4_0_w4_prep(const float * src1, sycl::half * act, const s
             return;
         }
         const int64_t j = i % QK4_0;
-        act[i] = (sycl::half) src1[i - j + j / 2 + (QK4_0 / 2) * (j % 2)];
+        act[i] = (sycl::half) src1[perm ? i - j + j / 2 + (QK4_0 / 2) * (j % 2) : i];
     });
     const int64_t ng = k / QK4_0, nd = rows * ng;
     stream->parallel_for(sycl::nd_range<1>((nd + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
@@ -3190,7 +3192,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
 #endif
 
 #if GGML_SYCL_DNNL
-    if (src0->type == GGML_TYPE_Q4_0 && g_ggml_sycl_q4_0_w4 && g_ggml_sycl_enable_dnn && src1->type == GGML_TYPE_F32 &&
+    if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && g_ggml_sycl_q4_0_w4 && g_ggml_sycl_enable_dnn &&
+        src1->type == GGML_TYPE_F32 &&
         (use_fp16 || g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F16) && ggml_sycl_src1_f16_ok(dst) &&
         dst->op_params[0] == GGML_PREC_DEFAULT && ggml_is_contiguous(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
         row_diff == src0->ne[1] && ldc == row_diff && src0_dd_i == src0->data && ne00 % QK4_0 == 0 && src0->extra) {
@@ -3202,9 +3205,10 @@ inline void ggml_sycl_op_mul_mat_sycl(
         if (extra->optimized_feature.reorder) {
             ggml_sycl_pool_alloc<sycl::half> act(ctx.pool(), src1_ncols * ne10);
             ggml_sycl_pool_alloc<sycl::half> d_t(ctx.pool(), row_diff * (ne00 / QK4_0));
-            const sycl::half * d_rows = (const sycl::half *) ((const uint8_t *) src0_dd_i + row_diff * ne00 / 2);
-            ggml_sycl_q4_0_w4_prep(src1_ddf_i, act.get(), d_rows, d_t.get(), row_diff, ne00, src1_ncols, stream);
-            DnnlGemmWrapper::q4_0_w4_gemm(ctx, row_diff, src1_ncols, ne00, src0_dd_i, d_t.get(), act.get(), dst_dd_i, stream);
+            const bool         q4     = src0->type == GGML_TYPE_Q4_0;
+            const sycl::half * d_rows = (const sycl::half *) ((const uint8_t *) src0_dd_i + row_diff * ne00 / (q4 ? 2 : 1));
+            ggml_sycl_q4_0_w4_prep(src1_ddf_i, act.get(), d_rows, d_t.get(), row_diff, ne00, src1_ncols, q4, stream);
+            DnnlGemmWrapper::q4_0_w4_gemm(ctx, row_diff, src1_ncols, ne00, src0_dd_i, d_t.get(), act.get(), dst_dd_i, q4, stream);
             GGML_UNUSED(src1_ddq_i);
             GGML_UNUSED(src1_padded_row_size);
             return;

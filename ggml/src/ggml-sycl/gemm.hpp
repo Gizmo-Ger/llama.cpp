@@ -85,17 +85,20 @@ public:
 
     // C[n][m] (f32, row stride m) = A[n][k] (f16) x W[k][m]: W = u4 values, m rows of k/2 contiguous bytes (tag ba),
     // zero point 8, one f16 scale per 32 k values in [k/32][m] order (q4_0 reorder layout, see ggml_sycl_q4_0_w4_prep)
+    // q8 (q4 == false): W = s8 values, m rows of k contiguous bytes, no zero point
     static void q4_0_w4_gemm(ggml_backend_sycl_context & ctx, int64_t m, int64_t n, int64_t k, const void * w,
-                             const sycl::half * scales, const sycl::half * a, float * c, const queue_ptr & q) {
+                             const sycl::half * scales, const sycl::half * a, float * c, bool q4, const queue_ptr & q) {
         auto stream = ctx.stream_dnnl(q);
         auto eng    = ctx.engine_dnnl(q);
         const auto a_md = dnnl::memory::desc({ n, k }, dt::f16, tag::ab);
-        const auto w_md = dnnl::memory::desc({ k, m }, dt::u4, tag::ba);
+        const auto w_md = dnnl::memory::desc({ k, m }, q4 ? dt::u4 : dt::s8, tag::ba);
         const auto c_md = dnnl::memory::desc({ n, m }, dt::f32, tag::ab);
         dnnl::primitive_attr attr;
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { 32, 1 }, dt::f16);
-        attr.set_zero_points(DNNL_ARG_WEIGHTS, 0, {}, dt::u8);
+        if (q4) {
+            attr.set_zero_points(DNNL_ARG_WEIGHTS, 0, {}, dt::u8);
+        }
         attr.set_fpmath_mode(dnnl::fpmath_mode::f16, true);
         auto pd = dnnl::matmul::primitive_desc(eng, a_md, w_md, c_md, attr);
 
@@ -111,7 +114,9 @@ public:
         args.insert({ DNNL_ARG_DST, dnnl::memory(c_md, eng, c) });
         args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
                       dnnl::memory(dnnl::memory::desc({ k / 32, m }, dt::f16, tag::ab), eng, const_cast<sycl::half *>(scales)) });
-        args.insert({ DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, dnnl::memory(dnnl::memory::desc({ 1 }, dt::u8, tag::a), eng, zp.get()) });
+        if (q4) {
+            args.insert({ DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, dnnl::memory(dnnl::memory::desc({ 1 }, dt::u8, tag::a), eng, zp.get()) });
+        }
         args.insert({ DNNL_ARG_SCRATCHPAD, dnnl::memory(scratchpad_md, eng, scratchpad_ptr) });
         dnnl::matmul(pd).execute(stream, args);
     }
