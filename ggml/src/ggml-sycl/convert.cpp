@@ -154,20 +154,13 @@ static void dequantize_row_q4_0_sycl(const void *vx, dst_t *y, const int64_t k,
 template <typename dst_t>
 static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
-
-    dpct::has_capability_or_fail(stream->get_device(),
-                                    {sycl::aspect::fp16});
-
-    int constexpr WARP_K = WARP_SIZE * QK4_0;
-    const int n_warp = (k + WARP_K - 1) / WARP_K;
-    GGML_ASSERT(k % 2 == 0);
-    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_warp) *
-        sycl::range<3>(1, 1, WARP_SIZE),
-        sycl::range<3>(1, 1, WARP_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]]{
-            dequantize_block_q4_0_reorder(vx, y, k, item_ct1);
-        });
-
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    GGML_ASSERT(k % QK4_0 == 0);
+    constexpr int     WG = 256;
+    const int64_t     n  = k / 8;
+    stream->parallel_for(sycl::nd_range<1>((n + WG - 1) / WG * WG, WG), [=](sycl::nd_item<1> item_ct1) {
+        dequantize_block_q4_0_reorder(vx, y, k, item_ct1);
+    });
 }
 
 template <typename dst_t>
@@ -202,20 +195,13 @@ static void dequantize_row_ptq1_0_sycl_reorder(const void * vx, dst_t * y, const
 template <typename dst_t>
 static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
-
-    dpct::has_capability_or_fail(stream->get_device(),
-                                    {sycl::aspect::fp16});
-
-    int constexpr WARP_K = WARP_SIZE * QK8_0;
-    const int n_warp = (k + WARP_K - 1) / WARP_K;
+    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
     GGML_ASSERT(k % QK8_0 == 0);
-    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_warp) *
-        sycl::range<3>(1, 1, WARP_SIZE),
-        sycl::range<3>(1, 1, WARP_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]]{
-            dequantize_block_q8_0_reorder(vx, y, k, item_ct1);
-        });
-
+    constexpr int     WG = 256;
+    const int64_t     n  = k / 4;
+    stream->parallel_for(sycl::nd_range<1>((n + WG - 1) / WG * WG, WG), [=](sycl::nd_item<1> item_ct1) {
+        dequantize_block_q8_0_reorder(vx, y, k, item_ct1);
+    });
 }
 
 template <typename dst_t>
