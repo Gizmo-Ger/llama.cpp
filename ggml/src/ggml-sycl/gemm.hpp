@@ -129,6 +129,39 @@ public:
         prim.execute(stream, args);
     }
 
+    // C[n][m] (f32, row stride m) = A[n][k] (f16) x W[k][m]: W = u4 values, m rows of k/2 contiguous bytes (tag ba),
+    // zero point 8, one f16 scale per 32 k values in [k/32][m] order (q4_0 reorder layout, see ggml_sycl_q4_0_w4_prep)
+    static void q4_0_w4_gemm(ggml_backend_sycl_context & ctx, int64_t m, int64_t n, int64_t k, const void * w,
+                             const sycl::half * scales, const sycl::half * a, float * c, const queue_ptr & q) {
+        auto stream = ctx.stream_dnnl(q);
+        auto eng    = ctx.engine_dnnl(q);
+        const auto a_md = dnnl::memory::desc({ n, k }, dt::f16, tag::ab);
+        const auto w_md = dnnl::memory::desc({ k, m }, dt::u4, tag::ba);
+        const auto c_md = dnnl::memory::desc({ n, m }, dt::f32, tag::ab);
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), { 32, 1 }, dt::f16);
+        attr.set_zero_points(DNNL_ARG_WEIGHTS, 0, {}, dt::u8);
+        attr.set_fpmath_mode(dnnl::fpmath_mode::f16, true);
+        auto pd = dnnl::matmul::primitive_desc(eng, a_md, w_md, c_md, attr);
+
+        ggml_sycl_pool_alloc<uint8_t> zp(ctx.pool(), 1);
+        q->memset(zp.get(), 8, 1);
+        const auto scratchpad_md = pd.scratchpad_desc();
+        ggml_sycl_pool_alloc<uint8_t> scratchpad(ctx.pool());
+        void * scratchpad_ptr = scratchpad_md.get_size() > 0 ? scratchpad.alloc(scratchpad_md.get_size()) : nullptr;
+
+        std::unordered_map<int, dnnl::memory> args;
+        args.insert({ DNNL_ARG_SRC, dnnl::memory(a_md, eng, const_cast<sycl::half *>(a)) });
+        args.insert({ DNNL_ARG_WEIGHTS, dnnl::memory(w_md, eng, const_cast<void *>(w)) });
+        args.insert({ DNNL_ARG_DST, dnnl::memory(c_md, eng, c) });
+        args.insert({ DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
+                      dnnl::memory(dnnl::memory::desc({ k / 32, m }, dt::f16, tag::ab), eng, const_cast<sycl::half *>(scales)) });
+        args.insert({ DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS, dnnl::memory(dnnl::memory::desc({ 1 }, dt::u8, tag::a), eng, zp.get()) });
+        args.insert({ DNNL_ARG_SCRATCHPAD, dnnl::memory(scratchpad_md, eng, scratchpad_ptr) });
+        dnnl::matmul(pd).execute(stream, args);
+    }
+
     static void row_gemm(ggml_backend_sycl_context & ctx, int m, int n, int k,
         const void * a, dt at, const void * b, dt bt, void * c, dt ct, const queue_ptr & q) {
 

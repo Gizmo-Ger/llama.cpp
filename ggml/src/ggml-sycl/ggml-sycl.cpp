@@ -108,6 +108,7 @@ int g_ggml_sycl_quant_s4_gemm = 1;
 int g_ggml_sycl_quant_w8a8 = 1;
 int g_ggml_sycl_enable_graph = 0;
 int g_ggml_sycl_enable_dnn = 1;
+int g_ggml_sycl_q4_0_w4 = 1;
 int g_ggml_sycl_fa_onednn = 1;
 int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
@@ -349,6 +350,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_quant_w8a8 = ggml_sycl_get_env("GGML_SYCL_QUANT_W8A8", 1);
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
+        g_ggml_sycl_q4_0_w4 = ggml_sycl_get_env("GGML_SYCL_Q4_0_W4", 1);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
@@ -451,6 +453,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_OPT: %d\n", g_ggml_sycl_enable_optimize);
         GGML_LOG_INFO("  GGML_SYCL_QUANT_F16_GEMM: %d\n", g_ggml_sycl_quant_f16_gemm);
         GGML_LOG_INFO("  GGML_SYCL_QUANT_S4_GEMM: %d\n", g_ggml_sycl_quant_s4_gemm);
+        GGML_LOG_INFO("  GGML_SYCL_Q4_0_W4: %d\n", g_ggml_sycl_q4_0_w4);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -2829,6 +2832,36 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+#if GGML_SYCL_DNNL
+static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream);
+
+// q4_0 prompt GEMM without the f16 weight copy: the reorder layout's quants ([rows][k/2] bytes, block byte i = element i
+// in the low nibble, element i+16 in the high one) are read by oneDNN as a u4 [k][rows] matrix (tag ba) with zero point 8
+// and one f16 scale per 32 values. The activations are converted to f16 in the same nibble order (32-value block j ->
+// element j/2 + 16*(j%2)) and the scales are transposed to the [k/32][rows] order oneDNN wants (tag ab).
+static void ggml_sycl_q4_0_w4_prep(const float * src1, sycl::half * act, const sycl::half * d_rows, sycl::half * d_t,
+                                   int64_t rows, int64_t k, int64_t ncols, dpct::queue_ptr stream) {
+    const int64_t nact = ncols * k;
+    stream->parallel_for(sycl::nd_range<1>((nact + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
+        const int64_t i = it.get_global_id(0);
+        if (i >= nact) {
+            return;
+        }
+        const int64_t j = i % QK4_0;
+        act[i] = (sycl::half) src1[i - j + j / 2 + (QK4_0 / 2) * (j % 2)];
+    });
+    const int64_t ng = k / QK4_0, nd = rows * ng;
+    stream->parallel_for(sycl::nd_range<1>((nd + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
+        const int64_t i = it.get_global_id(0);  // output index g * rows + r
+        if (i >= nd) {
+            return;
+        }
+        const int64_t g = i / rows, r = i % rows;
+        d_t[i] = d_rows[r * ng + g];
+    });
+}
+#endif
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -2910,6 +2943,29 @@ inline void ggml_sycl_op_mul_mat_sycl(
         GGML_UNUSED(src1_ddq_i);
         GGML_UNUSED(src1_padded_row_size);
         return;
+    }
+#endif
+
+#if GGML_SYCL_DNNL
+    if (src0->type == GGML_TYPE_Q4_0 && g_ggml_sycl_q4_0_w4 && g_ggml_sycl_enable_dnn && src1->type == GGML_TYPE_F32 &&
+        (use_fp16 || g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F16) && ggml_sycl_src1_f16_ok(dst) &&
+        dst->op_params[0] == GGML_PREC_DEFAULT && ggml_is_contiguous(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        row_diff == src0->ne[1] && ldc == row_diff && src0_dd_i == src0->data && ne00 % QK4_0 == 0 && src0->extra) {
+        ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) src0->extra;
+        if (!extra->optimized_feature.reorder && g_ggml_sycl_enable_optimize && ctx.opt_feature.reorder &&
+            reorder_qw(src0, stream)) {
+            extra->optimized_feature.reorder = true;
+        }
+        if (extra->optimized_feature.reorder) {
+            ggml_sycl_pool_alloc<sycl::half> act(ctx.pool(), src1_ncols * ne10);
+            ggml_sycl_pool_alloc<sycl::half> d_t(ctx.pool(), row_diff * (ne00 / QK4_0));
+            const sycl::half * d_rows = (const sycl::half *) ((const uint8_t *) src0_dd_i + row_diff * ne00 / 2);
+            ggml_sycl_q4_0_w4_prep(src1_ddf_i, act.get(), d_rows, d_t.get(), row_diff, ne00, src1_ncols, stream);
+            DnnlGemmWrapper::q4_0_w4_gemm(ctx, row_diff, src1_ncols, ne00, src0_dd_i, d_t.get(), act.get(), dst_dd_i, stream);
+            GGML_UNUSED(src1_ddq_i);
+            GGML_UNUSED(src1_padded_row_size);
+            return;
+        }
     }
 #endif
 
