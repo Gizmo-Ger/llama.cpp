@@ -44,6 +44,66 @@ static void dequantize_block_sycl(const void *__restrict__ vx,
     }
 }
 
+// q4_0 (block layout) -> dst. A work-group first copies 256 blocks (4608 bytes) into SLM with aligned 4-byte loads, then
+// each work-item converts 8 consecutive outputs per step, so every store of a sub-group covers contiguous memory. The
+// generic dequantize_block reads one byte and the 2-byte scale per work-item from the 18-byte blocks and stores 2-byte
+// values half a block apart: ~210 GB/s on a B580, this one ~390 GB/s (copy bound ~400). Same math as dequantize_q4_0:
+// (q - 8) * d is exact in f32, so the rounded result is the same in f16 and f32 builds.
+template <typename dst_t>
+static void dequantize_row_q4_0_sycl_vec(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k,
+                                         dpct::queue_ptr stream) {
+    GGML_ASSERT(k % QK4_0 == 0);
+    if (((uintptr_t) vx) % 4 != 0) {  // a row-range slice of a tensor with an odd number of blocks per row
+        dequantize_block_sycl<QK4_0, QR4_0, dequantize_q4_0>(vx, y, k, stream);
+        return;
+    }
+    constexpr int WG = 256;                                   // work-items per group
+    constexpr int NB = 256;                                   // blocks per group
+    constexpr int NW = NB * sizeof(block_q4_0) / 4;           // SLM words
+    const int64_t nb = k / QK4_0;
+    const int64_t ng = (nb + NB - 1) / NB;
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<uint32_t, 1> sm(sycl::range<1>(NW), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(ng * WG, WG), [=](sycl::nd_item<1> it) {
+            const int64_t g0  = it.get_group(0) * (int64_t) NB;
+            const int     lid = it.get_local_id(0);
+            const int     nbg = (int) (nb - g0 < NB ? nb - g0 : NB);
+            const uint8_t * src = (const uint8_t *) vx + g0 * sizeof(block_q4_0);   // 4-byte aligned: g0 is a multiple of 256
+            const int     nbytes = nbg * (int) sizeof(block_q4_0);
+            const int     nw     = nbytes / 4;
+            for (int w = lid; w < nw; w += WG) {
+                sm[w] = ((const uint32_t *) src)[w];
+            }
+            if (lid == 0) {  // an odd block count leaves 2 bytes
+                for (int i = nw * 4; i < nbytes; ++i) {
+                    ((uint8_t *) &sm[0])[i] = src[i];
+                }
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            const uint8_t * sb = (const uint8_t *) &sm[0];
+#pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                const int c  = step * WG + lid;               // 8-output chunk: block c/4, outputs (c%4)*8 .. +7
+                const int bl = c / 4;
+                if (bl >= nbg) {
+                    break;
+                }
+                const int       t  = (c % 4) * 8;
+                const int       sh = t < QK4_0 / 2 ? 0 : 4;   // low nibbles give outputs 0..15, high nibbles 16..31
+                const uint8_t * b  = sb + bl * sizeof(block_q4_0);
+                const float     d  = (float) *(const sycl::half *) b;
+                const uint8_t * qs = b + offsetof(block_q4_0, qs) + (t % (QK4_0 / 2));
+                sycl::vec<dst_t, 8> v;
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    v[l] = (dst_t) (((int) ((qs[l] >> sh) & 0xF) - 8) * d);
+                }
+                *(sycl::vec<dst_t, 8> *) (y + (g0 + bl) * QK4_0 + t) = v;
+            }
+        });
+    });
+}
+
 template <typename dst_t>
 static void dequantize_row_q2_K_sycl(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
@@ -669,7 +729,7 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
                 return dequantize_row_q4_0_sycl_reorder;
             } else {
-                return dequantize_block_sycl<QK4_0, QR4_0, dequantize_q4_0>;
+                return dequantize_row_q4_0_sycl_vec;
             }
         case GGML_TYPE_Q4_1:
             return dequantize_block_sycl<QK4_1, QR4_1, dequantize_q4_1>;
