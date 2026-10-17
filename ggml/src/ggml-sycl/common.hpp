@@ -404,6 +404,15 @@ struct ggml_backend_sycl_context {
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
+    // q4_0/q8_0 oneDNN route: the f16 (nibble-permuted) activations of the last call, reused by the next MUL_MAT on the
+    // same src1 (Q/K/V, gate/up run back to back on one input). Any other executed op clears the key (graph loop).
+    void *              w4_act_buf  = nullptr;
+    size_t              w4_act_cap  = 0;
+    const ggml_tensor * w4_act_src  = nullptr;
+    const void *        w4_act_data = nullptr;
+    int64_t             w4_act_n    = 0;
+    bool                w4_act_perm = false;
+
     explicit ggml_backend_sycl_context(int device) :
         device(device),
         name(GGML_SYCL_NAME + std::to_string(device)) {
