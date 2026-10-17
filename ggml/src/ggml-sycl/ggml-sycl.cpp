@@ -3112,23 +3112,46 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream);
 // element permutation.
 static void ggml_sycl_q4_0_w4_prep(const float * src1, sycl::half * act, const sycl::half * d_rows, sycl::half * d_t,
                                    int64_t rows, int64_t k, int64_t ncols, bool perm, dpct::queue_ptr stream) {
-    const int64_t nact = ncols * k;
-    stream->parallel_for(sycl::nd_range<1>((nact + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
-        const int64_t i = it.get_global_id(0);
-        if (i >= nact) {
+    // activations: 8 outputs per work-item. With perm, outputs j0..j0+7 of a 32-block come from elements j0/2..j0/2+3 and
+    // the same +16, interleaved.
+    const int64_t n8 = ncols * k / 8;
+    stream->parallel_for(sycl::nd_range<1>((n8 + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
+        const int64_t g = it.get_global_id(0);
+        if (g >= n8) {
             return;
         }
-        const int64_t j = i % QK4_0;
-        act[i] = (sycl::half) src1[perm ? i - j + j / 2 + (QK4_0 / 2) * (j % 2) : i];
+        const int64_t i0 = g * 8;
+        sycl::vec<sycl::half, 8> v;
+        if (perm) {
+            const int64_t j0 = i0 % QK4_0;
+            const float * b  = src1 + (i0 - j0) + j0 / 2;
+            const sycl::float4 lo = *(const sycl::float4 *) b;
+            const sycl::float4 hi = *(const sycl::float4 *) (b + QK4_0 / 2);
+            v = sycl::vec<sycl::half, 8>(lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3]);
+        } else {
+            const sycl::float4 a = *(const sycl::float4 *) (src1 + i0);
+            const sycl::float4 b = *(const sycl::float4 *) (src1 + i0 + 4);
+            v = sycl::vec<sycl::half, 8>(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+        }
+        *(sycl::vec<sycl::half, 8> *) (act + i0) = v;
     });
-    const int64_t ng = k / QK4_0, nd = rows * ng;
-    stream->parallel_for(sycl::nd_range<1>((nd + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
-        const int64_t i = it.get_global_id(0);  // output index g * rows + r
-        if (i >= nd) {
-            return;
-        }
-        const int64_t g = i / rows, r = i % rows;
-        d_t[i] = d_rows[r * ng + g];
+    // scales [rows][ng] -> [ng][rows] through 16 x 16 SLM tiles, so reads and writes are both contiguous
+    const int64_t ng = k / QK4_0;
+    constexpr int TS = 16;
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<sycl::half, 2> tile(sycl::range<2>(TS, TS + 1), cgh);
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>((rows + TS - 1) / TS * TS, (ng + TS - 1) / TS * TS),
+                                           sycl::range<2>(TS, TS)), [=](sycl::nd_item<2> it) {
+            const int64_t r0 = it.get_group(0) * TS, g0 = it.get_group(1) * TS;
+            const int     a  = it.get_local_id(0), b = it.get_local_id(1);
+            if (r0 + a < rows && g0 + b < ng) {
+                tile[a][b] = d_rows[(r0 + a) * ng + g0 + b];        // read along ng (contiguous in the source)
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            if (g0 + a < ng && r0 + b < rows) {
+                d_t[(g0 + a) * rows + r0 + b] = tile[b][a];         // write along rows (contiguous in the destination)
+            }
+        });
     });
 }
 #endif
