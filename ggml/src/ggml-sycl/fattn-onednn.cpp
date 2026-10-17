@@ -127,11 +127,39 @@ using namespace dnnl;
 using namespace dnnl::graph;
 
 // strided src (f16 or f32) -> contiguous f16 [ne0,ne1,ne2,ne3] (ne0 innermost). nb* are BYTE strides.
+// 8 elements per work-item with 16-byte loads/stores when ne0 % 8 == 0 and everything is 16-byte aligned.
 template <typename src_t>
 static void cont_to_f16_sycl(const char * src, sycl::half * dst,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
         size_t nb1, size_t nb2, size_t nb3, dpct::queue_ptr stream) {
     const int64_t n = ne0 * ne1 * ne2 * ne3;
+    if (ne0 % 8 == 0 && ((uintptr_t) src | (uintptr_t) dst | nb1 | nb2 | nb3) % 16 == 0) {
+        const int64_t n8 = n / 8;
+        stream->parallel_for(sycl::nd_range<1>((n8 + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
+            const int64_t g = it.get_global_id(0);
+            if (g >= n8) {
+                return;
+            }
+            const int64_t gid = g * 8;
+            const int64_t r   = gid / ne0;
+            const int64_t i0  = gid - r * ne0;
+            const int64_t i1  = r % ne1;
+            const int64_t r2  = r / ne1;
+            const int64_t i2  = r2 % ne2;
+            const int64_t i3  = r2 / ne2;
+            const src_t * p   = (const src_t *) (src + i1 * nb1 + i2 * nb2 + i3 * nb3) + i0;
+            sycl::vec<sycl::half, 8> v;
+            if constexpr (std::is_same_v<src_t, float>) {
+                const sycl::float4 a = *(const sycl::float4 *) p;
+                const sycl::float4 b = *(const sycl::float4 *) (p + 4);
+                v = sycl::vec<sycl::half, 8>(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]);
+            } else {
+                v = *(const sycl::vec<sycl::half, 8> *) p;
+            }
+            *(sycl::vec<sycl::half, 8> *) (dst + gid) = v;
+        });
+        return;
+    }
     stream->parallel_for(sycl::range<1>(n), [=](sycl::id<1> ix) {
         const int64_t gid = ix[0];
         int64_t       i   = gid;
@@ -144,9 +172,31 @@ static void cont_to_f16_sycl(const char * src, sycl::half * dst,
 }
 
 // oneDNN SDPA out (f16 contiguous [mb,H,q,d]) -> ggml dst (f32 [head_dim,H,n_tok,mb], contiguous).
+// 8 elements per work-item (16-byte load, two 16-byte stores) when d % 8 == 0 and both buffers are 16-byte aligned.
 static void permute_sdpa_out_sycl(const sycl::half * out, float * dst,
         int64_t mb, int64_t H, int64_t q, int64_t d, dpct::queue_ptr stream) {
     const int64_t n = mb * H * q * d;
+    if (d % 8 == 0 && ((uintptr_t) out | (uintptr_t) dst) % 16 == 0) {
+        const int64_t n8 = n / 8;
+        stream->parallel_for(sycl::nd_range<1>((n8 + 255) / 256 * 256, 256), [=](sycl::nd_item<1> it) {
+            const int64_t g = it.get_global_id(0);
+            if (g >= n8) {
+                return;
+            }
+            const int64_t gid = g * 8;
+            const int64_t r   = gid / d;
+            const int64_t e   = gid - r * d;
+            const int64_t t   = r % q;
+            const int64_t r2  = r / q;
+            const int64_t h   = r2 % H;
+            const int64_t b   = r2 / H;
+            const sycl::vec<sycl::half, 8> v = *(const sycl::vec<sycl::half, 8> *) (out + gid);
+            float * o = dst + e + h * d + t * d * H + b * d * H * q;
+            *(sycl::float4 *) o       = sycl::float4(v[0], v[1], v[2], v[3]);
+            *(sycl::float4 *) (o + 4) = sycl::float4(v[4], v[5], v[6], v[7]);
+        });
+        return;
+    }
     stream->parallel_for(sycl::range<1>(n), [=](sycl::id<1> ix) {
         const int64_t gid = ix[0];
         int64_t       i   = gid;

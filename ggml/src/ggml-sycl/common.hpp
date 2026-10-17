@@ -374,6 +374,8 @@ struct ggml_tensor_extra_gpu {
   dpct::event_ptr events[GGML_SYCL_MAX_DEVICES]
                         [GGML_SYCL_MAX_STREAMS]; // events for synchronizing multiple GPUs
   optimize_feature optimized_feature;
+  void *        w4_scales_t   = nullptr;  // q4_0/q8_0 oneDNN route: scales transposed to [k/32][rows], made once
+  sycl::queue * w4_scales_t_q = nullptr;
 };
 
 extern int g_ggml_sycl_use_level_zero_api;

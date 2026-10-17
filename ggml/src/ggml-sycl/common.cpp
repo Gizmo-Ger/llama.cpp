@@ -159,5 +159,8 @@ void release_extra_gpu(ggml_tensor_extra_gpu * extra, std::vector<queue_ptr> str
             SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(extra->data_device[i], *(streams[i]))));
         }
     }
+    if (extra->w4_scales_t != nullptr) {
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(extra->w4_scales_t, *extra->w4_scales_t_q)));
+    }
     delete extra;
 }
