@@ -718,7 +718,8 @@ static void convert_unary_sycl(const void * vx, dst_t * y, const int64_t k, dpct
 }
 
 
-to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
+// dequantize / convert to a 16-bit float type T (sycl::half, or bfloat16 for the XMX prompt GEMM of fp32 builds)
+template <typename T> static to_t_sycl_t<T> ggml_get_to_t16_sycl(ggml_type type, ggml_tensor * dst) {
     switch (type) {
         case GGML_TYPE_Q1_0:
             return dequantize_block_sycl<QK1_0, QR1_0, dequantize_q1_0>;
@@ -809,6 +810,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             return dequantize_row_mxfp4_sycl;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_sycl;
+        case GGML_TYPE_F16:
+            return convert_unary_sycl<sycl::half>;
         case GGML_TYPE_F32:
             return convert_unary_sycl<float>;
 #ifdef GGML_SYCL_HAS_BF16
@@ -819,6 +822,10 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             GGML_ABORT("fatal error: unsupport data type=%s\n", ggml_type_name(type));
             return nullptr;
     }
+}
+
+to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
+    return ggml_get_to_t16_sycl<sycl::half>(type, dst);
 }
 
 to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
@@ -927,18 +934,8 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
 
 
 #ifdef GGML_SYCL_HAS_BF16
-to_bf16_sycl_t ggml_get_to_bf16_sycl(ggml_type type, ggml_tensor * /*dst*/) {
-    switch (type) {
-        case GGML_TYPE_F32:
-            return convert_unary_sycl<float>;
-        case GGML_TYPE_F16:
-            return convert_unary_sycl<sycl::half>;
-        case GGML_TYPE_BF16:
-            return convert_unary_sycl<sycl::ext::oneapi::bfloat16>;
-        default:
-            GGML_ABORT("fatal error: unsupport data type=%s\n", ggml_type_name(type));
-            return nullptr;
-    }
+to_bf16_sycl_t ggml_get_to_bf16_sycl(ggml_type type, ggml_tensor * dst) {
+    return ggml_get_to_t16_sycl<sycl::ext::oneapi::bfloat16>(type, dst);
 }
 #endif
 
