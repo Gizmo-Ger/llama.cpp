@@ -2975,6 +2975,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
     if ((src0->type == GGML_TYPE_Q4_0 || src0->type == GGML_TYPE_Q8_0) && g_ggml_sycl_q4_0_w4 && g_ggml_sycl_enable_dnn &&
         src1->type == GGML_TYPE_F32 &&
         (use_fp16 || g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F16) && ggml_sycl_src1_f16_ok(dst) &&
+        dst->op == GGML_OP_MUL_MAT &&  // MUL_MAT_ID runs each expert as a struct copy of the whole tensor (shared extra)
         dst->op_params[0] == GGML_PREC_DEFAULT && ggml_is_contiguous(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
         row_diff == src0->ne[1] && ldc == row_diff && src0_dd_i == src0->data && ne00 % QK4_0 == 0 && src0->extra) {
         ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) src0->extra;
