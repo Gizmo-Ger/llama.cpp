@@ -3118,6 +3118,19 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream);
 // element j/2 + 16*(j%2)) and the scales are transposed to the [k/32][rows] order oneDNN wants (tag ab).
 // q8_0 takes the same route with its reorder layout ([rows][k] int8, then the scales) read as s8, no zero point and no
 // element permutation.
+#if GGML_SYCL_DNNL
+// checked before the route reorders anything: once per type and deterministic setting, the first time it is used. If
+// this oneDNN cannot build the matmul, the route stays off and the regular path runs instead of aborting
+static bool ggml_sycl_w4_route_ok(ggml_backend_sycl_context & ctx, int64_t m, int64_t n, int64_t k, bool q4, const queue_ptr & q) {
+    static int state[2][2] = { { -1, -1 }, { -1, -1 } };
+    int & s = state[q4][m <= 1024];
+    if (s < 0) {
+        s = DnnlGemmWrapper::q4_0_w4_supported(ctx, m, n, k, q4, q) ? 1 : 0;
+    }
+    return s == 1;
+}
+#endif
+
 static void ggml_sycl_q4_0_w4_prep(const float * src1, sycl::half * act, int64_t k, int64_t ncols, bool perm,
                                    dpct::queue_ptr stream) {
     // activations: 8 outputs per work-item. With perm, outputs j0..j0+7 of a 32-block come from elements j0/2..j0/2+3 and
@@ -3236,7 +3249,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
          g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_BF16) && ggml_sycl_src1_f16_ok(dst) &&
         dst->op == GGML_OP_MUL_MAT &&  // MUL_MAT_ID runs each expert as a struct copy of the whole tensor (shared extra)
         dst->op_params[0] == GGML_PREC_DEFAULT && ggml_is_contiguous(src0) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
-        row_diff == src0->ne[1] && ldc == row_diff && src0_dd_i == src0->data && ne00 % QK4_0 == 0 && src0->extra) {
+        row_diff == src0->ne[1] && ldc == row_diff && src0_dd_i == src0->data && ne00 % QK4_0 == 0 && src0->extra &&
+        ggml_sycl_w4_route_ok(ctx, row_diff, src1_ncols, ne00, src0->type == GGML_TYPE_Q4_0, stream)) {
         ggml_tensor_extra_gpu * extra = (ggml_tensor_extra_gpu *) src0->extra;
         if (!extra->optimized_feature.reorder && g_ggml_sycl_enable_optimize && ctx.opt_feature.reorder &&
             reorder_qw(src0, stream)) {

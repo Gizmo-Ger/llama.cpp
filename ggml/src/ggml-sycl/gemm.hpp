@@ -86,10 +86,7 @@ public:
     // C[n][m] (f32, row stride m) = A[n][k] (f16) x W[k][m]: W = u4 values, m rows of k/2 contiguous bytes (tag ba),
     // zero point 8, one f16 scale per 32 k values in [k/32][m] order (q4_0 reorder layout, see ggml_sycl_q4_0_w4_prep)
     // q8 (q4 == false): W = s8 values, m rows of k contiguous bytes, no zero point
-    static void q4_0_w4_gemm(ggml_backend_sycl_context & ctx, int64_t m, int64_t n, int64_t k, const void * w,
-                             const sycl::half * scales, const sycl::half * a, float * c, bool q4, const queue_ptr & q) {
-        auto stream = ctx.stream_dnnl(q);
-        auto eng    = ctx.engine_dnnl(q);
+    static dnnl::matmul::primitive_desc q4_0_w4_pd(const dnnl::engine & eng, int64_t m, int64_t n, int64_t k, bool q4) {
         const auto a_md = dnnl::memory::desc({ n, k }, dt::f16, tag::ab);
         const auto w_md = dnnl::memory::desc({ k, m }, q4 ? dt::u4 : dt::s8, tag::ba);
         const auto c_md = dnnl::memory::desc({ n, m }, dt::f32, tag::ab);
@@ -106,7 +103,29 @@ public:
             attr.set_zero_points(DNNL_ARG_WEIGHTS, 0, {}, dt::u8);
         }
         attr.set_fpmath_mode(dnnl::fpmath_mode::f16, true);
-        auto pd = dnnl::matmul::primitive_desc(eng, a_md, w_md, c_md, attr);
+        return dnnl::matmul::primitive_desc(eng, a_md, w_md, c_md, attr);
+    }
+
+    // whether this oneDNN builds the weight-decompression matmul at all (older versions or other GPUs may not)
+    static bool q4_0_w4_supported(ggml_backend_sycl_context & ctx, int64_t m, int64_t n, int64_t k, bool q4, const queue_ptr & q) {
+        try {
+            q4_0_w4_pd(ctx.engine_dnnl(q), m, n, k, q4);
+            return true;
+        } catch (const dnnl::error & e) {
+            GGML_LOG_WARN("%s: oneDNN cannot build the %s weight-decompression GEMM (%s), using the regular path\n", __func__,
+                          q4 ? "q4_0" : "q8_0", e.what());
+            return false;
+        }
+    }
+
+    static void q4_0_w4_gemm(ggml_backend_sycl_context & ctx, int64_t m, int64_t n, int64_t k, const void * w,
+                             const sycl::half * scales, const sycl::half * a, float * c, bool q4, const queue_ptr & q) {
+        auto stream = ctx.stream_dnnl(q);
+        auto eng    = ctx.engine_dnnl(q);
+        const auto a_md = dnnl::memory::desc({ n, k }, dt::f16, tag::ab);
+        const auto w_md = dnnl::memory::desc({ k, m }, q4 ? dt::u4 : dt::s8, tag::ba);
+        const auto c_md = dnnl::memory::desc({ n, m }, dt::f32, tag::ab);
+        auto pd = q4_0_w4_pd(eng, m, n, k, q4);
 
         ggml_sycl_pool_alloc<uint8_t> zp(ctx.pool(), 1);
         q->memset(zp.get(), 8, 1);
