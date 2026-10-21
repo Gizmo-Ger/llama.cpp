@@ -170,6 +170,17 @@ The first long prompt after the very first start compiles the XMX kernels (about
 that. If the server ever hangs during start-up in GPU initialisation after being killed mid-compile, move
 `~/.cache/neo_compiler_cache` aside.
 
+Serving tips, from testers and the B580:
+
+- Serve one request at a time (`-np 1`, as above). MTP drafts land far more often that way: a tester with two Arc Pro
+  B70s measured 31-74% draft acceptance at `-np 1` against 21-31% at `--parallel 4`. For several users on several cards,
+  run one `-np 1` server per card behind a load balancer rather than one server with several slots.
+- Keep the n-gram drafter on alongside MTP (`--spec-type draft-mtp,ngram-mod --spec-ngram-mod-n-max 256`, as above).
+  It helps most on JSON, file edits and code. B580 on BetterBench 0.6.1 (temperature 0.7, thinking off, 131K context):
+  83.8 t/s combined.
+- With the public mtp-lean model, leave `LLAMA_MTP_CHAIN` unset. Forcing it on (`=1`) gives byte-identical output but is
+  about 2-3% slower there (confirmed on a B580 and a B70). It turns itself on for a GGUF with a trimmed draft head.
+
 ## As a coding agent (Claude Code)
 
 llama-server speaks the Anthropic Messages API, so Claude Code can use Bonsai as its model: file reads and edits, shell
