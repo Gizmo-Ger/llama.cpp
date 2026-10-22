@@ -373,6 +373,11 @@ private:
 
     std::vector<swap_info> output_swaps;
 
+    // ARC-LAB: buffers filled per token rather than per output (unmasked nextn rows, layer inputs) are written in ubatch
+    // processing order. When the split reordered the batch (split_equal over several sequences), this holds the batch
+    // index of each processed token, and output_reorder() moves those rows back to batch order. Empty = already in order.
+    std::vector<int32_t> token_order;
+
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
