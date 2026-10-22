@@ -832,6 +832,18 @@ int llama_sync_trim() {
     return v;
 }
 
+// ARC-LAB: LLAMA_NEXTN_TOKEN_ORDER (default 1): put token-indexed rows (unmasked nextn = the MTP hook's h rows, layer
+// inputs) back in batch order after a reordering ubatch split. 0 = old behaviour: rows stay in processing order and get
+// the output-index swaps, which hands the MTP draft another sequence's (or another position's) hidden state whenever a
+// multi-sequence batch is split unevenly (-np > 1 with a hybrid/recurrent target).
+static bool llama_nextn_token_order() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_NEXTN_TOKEN_ORDER");
+        return e ? atoi(e) != 0 : true;
+    }();
+    return v;
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
@@ -2163,6 +2175,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     sync_pending = true;
 
     output_swaps.clear();
+    token_order.clear();
 
     sched_reserve();
 
@@ -2457,6 +2470,37 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
 
+    // ARC-LAB: remember the processing order when token-indexed rows were written and the split reordered the batch
+    {
+        bool tok_rows = embd_nextn.data && !cparams.embeddings_nextn_masked;
+        for (const auto & b : embd_layer_inp) {
+            tok_rows = tok_rows || b.size > 0;
+        }
+        const auto & tok_ids = balloc->get_tok_ids();
+        bool reordered = false;
+        if (tok_rows && tok_ids.size() == n_tokens_all) {
+            for (uint32_t i = 0; i < n_tokens_all && !reordered; ++i) {
+                reordered = tok_ids[i] != (int32_t) i;
+            }
+        }
+        if (reordered) {
+            if (llama_nextn_token_order()) {
+                token_order = tok_ids;
+            }
+            // the old output-index swaps put these rows in order only when every token was an output
+            static uint64_t n_reordered = 0, n_mixed = 0;
+            const bool mixed = n_outputs_all != n_tokens_all;
+            n_reordered++;
+            n_mixed += mixed;
+            if (n_reordered <= 8 || n_reordered % 256 == 0) {
+                LLAMA_LOG_WARN("%s: token-indexed rows out of batch order (%s): n_tokens = %u, n_outputs = %u (%s), "
+                        "%" PRIu64 " batches so far, %" PRIu64 " with non-output tokens\n", __func__,
+                        llama_nextn_token_order() ? "reordered" : "LLAMA_NEXTN_TOKEN_ORDER=0, left as is",
+                        n_tokens_all, n_outputs_all, mixed ? "has non-output tokens" : "all outputs", n_reordered, n_mixed);
+            }
+        }
+    }
+
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
 
@@ -2720,6 +2764,28 @@ void llama_context::output_reorder() {
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
+    // ARC-LAB: token-indexed rows (unmasked nextn, layer inputs) from processing order back to batch order
+    if (!token_order.empty()) {
+        const size_t n_tok = token_order.size();
+        std::vector<float> tmp;
+        auto put_in_order = [&](buffer_view<float> & buf, size_t row) {
+            GGML_ASSERT(n_tok * row <= buf.size);
+            tmp.assign(buf.data, buf.data + n_tok * row);
+            for (size_t r = 0; r < n_tok; ++r) {
+                std::memcpy(buf.data + (size_t) token_order[r] * row, tmp.data() + r * row, row * sizeof(float));
+            }
+        };
+        if (embd_nextn.data && !cparams.embeddings_nextn_masked) {
+            put_in_order(embd_nextn, n_embd_out);
+        }
+        for (auto & b : embd_layer_inp) {
+            if (b.size > 0) {
+                put_in_order(b, n_embd);
+            }
+        }
+        token_order.clear();
+    }
+
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
@@ -2742,13 +2808,15 @@ void llama_context::output_reorder() {
                 std::swap(embd_capture.data[i0 * row + k], embd_capture.data[i1 * row + k]);
             }
         }
-        if (embd_nextn.size > 0) {
+        // ARC-LAB: token-indexed buffers were put in order from token_order above (LLAMA_NEXTN_TOKEN_ORDER)
+        const bool tok_fix = llama_nextn_token_order();
+        if (embd_nextn.size > 0 && !(tok_fix && !cparams.embeddings_nextn_masked)) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
             }
         }
 
-        if (embd_layer_inp.size() > 0) {
+        if (embd_layer_inp.size() > 0 && !tok_fix) {
             for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
                 if (embd_layer_inp[lid].size > 0) {
                     for (uint64_t k = 0; k < n_embd; ++k) {
