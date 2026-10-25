@@ -757,12 +757,12 @@ static to_t_sycl_t<dst_t> ggml_get_dequant_sycl(ggml_type type, ggml_tensor * ds
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_sycl;
         case GGML_TYPE_F32:
-            if constexpr (std::is_same_v<dst_t, sycl::half>) {
+            if constexpr (!std::is_same_v<dst_t, float>) {
                 return convert_unary_sycl<float>;
             }
             break;
         case GGML_TYPE_F16:
-            if constexpr (std::is_same_v<dst_t, float>) {
+            if constexpr (!std::is_same_v<dst_t, sycl::half>) {
                 return convert_unary_sycl<sycl::half>;
             }
             break;
@@ -786,17 +786,8 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
 
 
 #ifdef GGML_SYCL_HAS_BF16
-to_bf16_sycl_t ggml_get_to_bf16_sycl(ggml_type type, ggml_tensor * /*dst*/) {
-    switch (type) {
-        case GGML_TYPE_F32:
-            return convert_unary_sycl<float>;
-        case GGML_TYPE_F16:
-            return convert_unary_sycl<sycl::half>;
-        case GGML_TYPE_BF16:
-            return convert_unary_sycl<sycl::ext::oneapi::bfloat16>;
-        default:
-            GGML_ABORT("fatal error: unsupport data type=%s\n", ggml_type_name(type));
-    }
+to_bf16_sycl_t ggml_get_to_bf16_sycl(ggml_type type, ggml_tensor * dst) {
+    return ggml_get_dequant_sycl<sycl::ext::oneapi::bfloat16>(type, dst);
 }
 #endif
 

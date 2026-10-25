@@ -3169,7 +3169,9 @@ inline void ggml_sycl_op_mul_mat_sycl(
 #ifdef GGML_SYCL_F16
     bool use_fp16 = true;  // TODO(Yu) SYCL capability check
 #else
-    bool use_fp16 = false;
+    // fp32 builds, GGML_SYCL_DYNAMIC_PRECISION=F16: prompt batches on quantized weights take the XMX f16 GEMM below
+    bool use_fp16 = g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_F16 &&
+                    ggml_is_quantized(src0->type) && src1_ncols > 32;
 #endif
 
 #if GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
@@ -3211,6 +3213,29 @@ inline void ggml_sycl_op_mul_mat_sycl(
                                      row_diff, src1_ncols, ne10, ldc, ctx.pool(), stream)) {
         return;
     }
+
+#if !defined(GGML_SYCL_F16) && GGML_SYCL_DNNL && defined(GGML_SYCL_HAS_BF16)
+    // fp32 builds, GGML_SYCL_DYNAMIC_PRECISION=BF16: prompt batches on quantized weights dequantize to bf16
+    // and run the oneDNN GEMM on XMX instead of the f32 GEMM below
+    const int32_t src1_prec = ggml_sycl_src1_prec(dst);
+    if (g_ggml_sycl_dynamic_precision == GGML_SYCL_DYNAMIC_PRECISION_BF16 && ggml_is_quantized(src0->type) &&
+        src1_ncols > 32 && ggml_is_contiguous(src0) && row_diff == src0->ne[1] &&
+        dst->op_params[0] == GGML_PREC_DEFAULT && (src1_prec == GGML_PREC_UNDEFINED || src1_prec >= GGML_PREC_BF16) &&
+        g_ggml_sycl_enable_dnn && ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device())) {
+        using bf16_t = sycl::ext::oneapi::bfloat16;
+        ggml_sycl_pool_alloc<bf16_t> src0_as_bf16(ctx.pool(), row_diff*ne00);
+        ggml_sycl_pool_alloc<bf16_t> src1_as_bf16(ctx.pool(), src1_ncols*ne10);
+        ggml_get_to_bf16_sycl(src0->type, dst)(src0_dd_i, src0_as_bf16.get(), row_diff*ne00, stream);
+        ggml_get_to_bf16_sycl(src1->type, dst)(src1_ddf_i, src1_as_bf16.get(), src1_ncols*ne10, stream);
+        DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10,
+                                  src0_as_bf16.get(), DnnlGemmWrapper::to_dt<bf16_t>(),
+                                  src1_as_bf16.get(), DnnlGemmWrapper::to_dt<bf16_t>(),
+                                  dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
+        GGML_UNUSED(src1_ddq_i);
+        GGML_UNUSED(src1_padded_row_size);
+        return;
+    }
+#endif
 
     // the f16 route converts src1 to f16 [TAG_GGML_PREC]
     use_fp16 = use_fp16 && ggml_sycl_src1_f16_ok(dst);
