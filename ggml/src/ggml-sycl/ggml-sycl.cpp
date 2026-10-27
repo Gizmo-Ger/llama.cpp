@@ -112,6 +112,9 @@ int g_ggml_sycl_q4_0_w4 = 1;
 int g_ggml_sycl_w4_act_reuse = 1;          // reuse converted activations across back-to-back MUL_MATs on one src1
 int64_t g_ggml_sycl_w4_scale_cache_mb = 512;  // budget for per-tensor transposed scales; past it, transpose per call
 static int64_t g_ggml_sycl_w4_scale_cache_used = 0;
+int g_ggml_sycl_dynamic_precision = GGML_SYCL_DYNAMIC_PRECISION_DEFAULT;
+int g_ggml_sycl_dynamic_required_precision = GGML_SYCL_DYNAMIC_PRECISION_F32;
+static const char * ggml_sycl_dynamic_precision_names[] = { "F16", "BF16", "TF32", "F32" };
 int g_ggml_sycl_fa_onednn = 1;
 int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
@@ -342,6 +345,17 @@ struct ggml_sycl_l0_adapter_default {
 } ggml_sycl_l0_adapter_default_init;
 }
 
+static int ggml_sycl_get_env_precision(const char * name, int def) {
+    const char * env = getenv(name);
+    if (!env || !*env) return def;
+    std::string mode(env);
+    for (int i = GGML_SYCL_DYNAMIC_PRECISION_F16; i <= GGML_SYCL_DYNAMIC_PRECISION_F32; i++) {
+        if (mode == ggml_sycl_dynamic_precision_names[i]) return i;
+    }
+    GGML_LOG_WARN("%s: unknown %s=%s, using %s\n", __func__, name, env, ggml_sycl_dynamic_precision_names[def]);
+    return def;
+}
+
 static void ggml_check_sycl() try {
     static bool initialized = false;
 
@@ -356,6 +370,10 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_q4_0_w4 = ggml_sycl_get_env("GGML_SYCL_Q4_0_W4", 1);
         g_ggml_sycl_w4_act_reuse = ggml_sycl_get_env("GGML_SYCL_W4_ACT_REUSE", 1);
         g_ggml_sycl_w4_scale_cache_mb = ggml_sycl_get_env("GGML_SYCL_W4_SCALE_CACHE_MB", 512);
+        g_ggml_sycl_dynamic_precision =
+            ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
+        g_ggml_sycl_dynamic_required_precision =
+            ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_REQUIRED_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_F32);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
@@ -459,6 +477,10 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_QUANT_F16_GEMM: %d\n", g_ggml_sycl_quant_f16_gemm);
         GGML_LOG_INFO("  GGML_SYCL_QUANT_S4_GEMM: %d\n", g_ggml_sycl_quant_s4_gemm);
         GGML_LOG_INFO("  GGML_SYCL_Q4_0_W4: %d\n", g_ggml_sycl_q4_0_w4);
+        GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_PRECISION: %s\n",
+                      ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_precision]);
+        GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_REQUIRED_PRECISION: %s\n",
+                      ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_required_precision]);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -2894,6 +2916,19 @@ static void ggml_sycl_q4_0_w4_scales_t(const sycl::half * d_rows, sycl::half * d
             }
         });
     });
+}
+#endif
+
+// Stub: fused dequant GEMM not available on arc-b580 (requires fused-gemm.cpp from shared upstream)
+static inline bool ggml_sycl_fused_dequant_gemm(ggml_type, const char *, const float *, ggml_type, int32_t, float *,
+                                                 int64_t, int64_t, int64_t, int64_t, ggml_sycl_pool &, const queue_ptr &) {
+    return false;
+}
+
+#if GGML_SYCL_DNNL
+// true when oneDNN has an optimized GEMM for this device (always true for Xe2)
+static inline bool ggml_sycl_dnnl_has_optimized_gemm(int /*device*/) {
+    return true;
 }
 #endif
 

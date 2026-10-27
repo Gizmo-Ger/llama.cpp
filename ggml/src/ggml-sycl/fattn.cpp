@@ -20,7 +20,6 @@
 #include "fattn.hpp"
 #include "fattn-onednn.hpp"
 #include "fattn-dec.hpp"
-#include "fattn-sparse.hpp"
 #include "fattn-dpas.hpp"
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \

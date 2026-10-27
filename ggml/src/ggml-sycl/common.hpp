@@ -75,6 +75,40 @@ extern int g_ggml_sycl_memtrace;
 extern int g_ggml_sycl_memtrace_step;
 extern int g_ggml_sycl_graph_eviction_timeout;
 
+// GGML_SYCL_DYNAMIC_PRECISION: operand type of the XMX dequant-GEMM paths
+enum ggml_sycl_dynamic_precision {
+    GGML_SYCL_DYNAMIC_PRECISION_F16,
+    GGML_SYCL_DYNAMIC_PRECISION_BF16,
+    GGML_SYCL_DYNAMIC_PRECISION_TF32,
+    GGML_SYCL_DYNAMIC_PRECISION_F32,
+};
+#ifdef GGML_SYCL_F16
+static constexpr int GGML_SYCL_DYNAMIC_PRECISION_DEFAULT = GGML_SYCL_DYNAMIC_PRECISION_F16;
+#else
+static constexpr int GGML_SYCL_DYNAMIC_PRECISION_DEFAULT = GGML_SYCL_DYNAMIC_PRECISION_F32;
+#endif
+extern int g_ggml_sycl_dynamic_precision;
+extern int g_ggml_sycl_dynamic_required_precision;
+
+// GGML_PREC extensions not in upstream ggml.h
+#ifndef GGML_PREC_BF16
+#define GGML_PREC_BF16      20
+#endif
+#ifndef GGML_PREC_UNDEFINED
+#define GGML_PREC_UNDEFINED  (-1)
+#endif
+
+// [TAG_GGML_PREC] src1 precision request of the MUL_MAT/MUL_MAT_ID op dst
+static inline int32_t ggml_sycl_src1_prec(const ggml_tensor * dst) {
+    return g_ggml_sycl_dynamic_required_precision == GGML_SYCL_DYNAMIC_PRECISION_F16 ? GGML_PREC_UNDEFINED :
+                                                                                       dst->op_params[3];
+}
+
+// true when the f16 route's precision is acceptable for dst
+static inline bool ggml_sycl_src1_f16_ok(const ggml_tensor * dst) {
+    const int32_t p = ggml_sycl_src1_prec(dst);
+    return p == GGML_PREC_DEFAULT || p == GGML_PREC_UNDEFINED;
+}
 
 #if defined(__clang__) && __has_builtin(__builtin_expect)
 // Hint the optimizer to pipeline the more likely following instruction in branches
