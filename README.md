@@ -3,10 +3,10 @@
 > [!NOTE]
 > **This is the `arc-b580` branch — optimized for running Qwen3.8-27B-Flash-MTP (PTQ1_0 ternary, 5.79 GB) on an Intel Arc B580 (12 GB, Xe2 Battlemage).**
 >
-> **Performance:** 54 t/s generation (prose) · 65 t/s (code) · 945 t/s prompt processing (4k warm) · MTP draft acceptance 43–65%
+> **Performance:** 59.6 t/s generation (prose) · 65 t/s (code) · 939 t/s prompt processing (4k warm) · MTP draft acceptance 46–65%
 >
-> 18 cherry-picked commits from Torchit1 feature branches: DPAS flash attention, oneDNN XMX GEMMs (q4_0/q8_0),
-> reorder-layout dequant, MTP batch-order fix, device-alloc fix, plus glue stubs.
+> 20 cherry-picked commits from Torchit1 feature branches: DPAS flash attention, oneDNN XMX GEMMs (q4_0/q8_0),
+> reorder-layout dequant, MMQ cleanup, get_rows fix, MTP batch-order fix, device-alloc fix, plus glue stubs.
 >
 > **Quick start:** see [docs/arc-b580-setup.md](docs/arc-b580-setup.md) for build & run instructions.
 > Everything below is upstream llama.cpp.

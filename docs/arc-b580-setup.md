@@ -57,18 +57,19 @@ build-sycl\bin\llama-server.exe ^
 
 | Metric | Value |
 |---|---|
-| Generation (prose) | 54.3 t/s |
+| Generation (prose, 37k tokens) | 59.6 t/s avg, peak 86 t/s |
 | Generation (code) | 64.7 t/s |
-| Prompt processing (4k warm) | 945 t/s |
-| MTP draft acceptance | 43–65% (content dependent) |
-| Mean draft length | ~3.0 tokens |
+| Prompt processing (4k warm) | 939 t/s |
+| MTP draft acceptance | 46–65% (content dependent) |
+| Mean draft length | 3.43 tokens |
 | VRAM | ~9.5 GB with q4_0 KV at 131k context |
 
 Speculative decoding: MTP draft + ngram modifier. Code gets higher acceptance due to repetition patterns.
+Long generations show high-burst windows (125–280 t/s over 3s) when draft acceptance spikes.
 
 ## Cherry-Picked Patches
 
-18 commits from [Torchit1/llama.cpp](https://github.com/Torchit1/llama.cpp) feature branches:
+20 commits from [Torchit1/llama.cpp](https://github.com/Torchit1/llama.cpp) feature branches:
 
 | Series | Commits | Effect |
 |---|---|---|
@@ -79,6 +80,8 @@ Speculative decoding: MTP draft + ngram modifier. Code gets higher acceptance du
 | XMX MMQ (oneDNN) | 8 | q4_0/q8_0 through oneDNN u4/s8 with vectorized activation conversion |
 | P2P device alloc | 1 | PTQ1_0/PQ2_0 and FA scratch buffers via `ggml_sycl_malloc_device` |
 | Upstream stubs | 1 | Glue for functions referenced by cherry-picks but absent on arc-b580 |
+| get_rows reorder fix | 1 | Fix incorrect get_rows on reordered quantized weights |
+| MMQ launch dedup | 1 | Collapse duplicate need_check launch bodies in MMQ (-338 lines) |
 
 The XMX-MMQ/reorder-dequant patches are ready for q4_0/q8_0 quants but don't activate on PTQ1_0.
 
