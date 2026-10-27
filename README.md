@@ -1,9 +1,15 @@
 # llama.cpp
 
 > [!NOTE]
-> **This is the `arc-b580` branch: Bonsai 2 27B (PrismML ternary PTQ1_0) running fast on a 12 GB Intel Arc B580.**
-> At 128K context: ~83 t/s on fresh code with speculative decoding, 250-360 t/s on edits, ~41 t/s plain decode.
-> Build, run and results: **[docs/bonsai-arc-b580.md](docs/bonsai-arc-b580.md)**. Everything below is upstream llama.cpp.
+> **This is the `arc-b580` branch — optimized for running Qwen3.8-27B-Flash-MTP (PTQ1_0 ternary, 5.79 GB) on an Intel Arc B580 (12 GB, Xe2 Battlemage).**
+>
+> **Performance:** 54 t/s generation (prose) · 65 t/s (code) · 945 t/s prompt processing (4k warm) · MTP draft acceptance 43–65%
+>
+> 18 cherry-picked commits from Torchit1 feature branches: DPAS flash attention, oneDNN XMX GEMMs (q4_0/q8_0),
+> reorder-layout dequant, MTP batch-order fix, device-alloc fix, plus glue stubs.
+>
+> **Quick start:** see [docs/arc-b580-setup.md](docs/arc-b580-setup.md) for build & run instructions.
+> Everything below is upstream llama.cpp.
 
 
 > [!IMPORTANT]
